@@ -80,6 +80,48 @@ extern "C" __global__ void dequant_nvfp4(const u8* q, const u8* bscale, const fl
     }
 }
 
+
+// Dequantize W4A8 (asym_w4a8_int8) directly to signed int8:
+// q: packed 4-bit nibbles [N, K/2] (lo nibble = even col, hi nibble = odd col)
+// s_rel: [N, K/16] fp8 e4m3
+// cb: [16] codebook floats
+// out: [N, K] signed int8 [-128, 127]
+extern "C" __global__ void dequant_w4a8_to_i8(const u8* q, const u8* s_rel, const float* cb,
+                                             signed char* out, unsigned long long N, unsigned long long K) {
+    unsigned long long n = N * K;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long r = i / K;
+        unsigned long long c = i % K;
+        u8 byte = q[r * (K / 2) + c / 2];
+        int nib = (c & 1) ? (byte >> 4) : (byte & 15);
+        u8 sr_byte = s_rel[r * (K / 16) + c / 16];
+        float s = fp8e4m3(sr_byte);
+        float v = cb[nib] * s;
+        int iv = __float2int_rn(v);
+        out[i] = (signed char)max(-128, min(127, iv));
+    }
+}
+
+// Full float dequantization of W4A8: out[i] = (cb[nib] * s_rel) * s_channel
+extern "C" __global__ void dequant_w4a8(const u8* q, const u8* s_rel, const float* s_channel,
+                                        const float* cb, void* out, unsigned long long N,
+                                        unsigned long long K, int okind) {
+    unsigned long long n = N * K;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long r = i / K;
+        unsigned long long c = i % K;
+        u8 byte = q[r * (K / 2) + c / 2];
+        int nib = (c & 1) ? (byte >> 4) : (byte & 15);
+        u8 sr_byte = s_rel[r * (K / 16) + c / 16];
+        float s = fp8e4m3(sr_byte);
+        float sc = s_channel[r];
+        float v = cb[nib] * s * sc;
+        stf(out, okind, i, v);
+    }
+}
+
 // Per (token, head) row: optional RMSNorm (optional weight), then split-half RoPE over the first
 // rot dims. x is read at x + s*row_stride + col_off + h*D (elements); out is contiguous [S, H, D].
 // cs: [S, rot/2] cos then sin tables as f32 (cs = cos, cs + S*rot/2 = sin). D <= 256.
@@ -532,11 +574,18 @@ fn ptx() -> Result<&'static str> {
     let r = PTX.get_or_init(|| {
         let opts = candle_core::cuda_backend::cudarc::nvrtc::CompileOptions {
             use_fast_math: Some(false),
-            options: vec!["--std=c++17".into()],
+            options: vec!["--std=c++17".into(), "--gpu-architecture=compute_86".into()],
             ..Default::default()
         };
         candle_core::cuda_backend::cudarc::nvrtc::compile_ptx_with_opts(SRC, opts)
-            .map(|p| p.to_src())
+            .map(|p| {
+                let src = p.to_src();
+                if src.contains(".version 9.4") {
+                    src.replace(".version 9.4", ".version 9.3")
+                } else {
+                    src
+                }
+            })
             .map_err(|e| format!("nvrtc: {e:?}"))
     });
     r.as_deref().map_err(|e| candle_core::Error::Msg(e.clone()))
@@ -587,6 +636,7 @@ fn alloc_out(dev: &candle_core::CudaDevice, dt: DType, n: usize) -> Result<CudaS
         DType::F32 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<f32>(n)? }, dev.clone()),
         DType::F16 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<half::f16>(n)? }, dev.clone()),
         DType::BF16 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<half::bf16>(n)? }, dev.clone()),
+        DType::U8 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<u8>(n)? }, dev.clone()),
         d => candle_core::bail!("alloc_out {d:?}"),
     })
 }
@@ -674,6 +724,97 @@ impl CustomOp3 for DequantNvfp4 {
 }
 
 /// NVFP4 packed weight `[N, K/2]` (U8), swizzled fp8 block scales (U8 bytes), f32 global scale.
+
+struct DequantW4A8ToI8 {
+    cb: Tensor,
+    k: usize,
+}
+impl CustomOp2 for DequantW4A8ToI8 {
+    fn name(&self) -> &'static str {
+        "dequant_w4a8_to_i8"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("dequant_w4a8_to_i8: cuda only")
+    }
+    fn cuda_fwd(
+        &self,
+        q: &CudaStorage,
+        ql: &Layout,
+        s_rel: &CudaStorage,
+        srl: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        need_contig(ql, "w4a8 q")?;
+        need_contig(srl, "w4a8 s_rel")?;
+        let rows = ql.shape().dims()[0];
+        let n = rows * self.k;
+        let dev = q.device().clone();
+        let func = dev.get_or_load_custom_func("dequant_w4a8_to_i8", MODULE, ptx()?)?;
+        let out = alloc_out(&dev, DType::U8, n)?;
+        let (cb_storage, cb_layout) = self.cb.storage_and_layout();
+        let cbp = match &*cb_storage {
+            Storage::Cuda(c) => dev_ptr(c, cb_layout)?,
+            _ => candle_core::bail!("w4a8 codebook must be on cuda"),
+        };
+        let (qp, srp, op) = (dev_ptr(q, ql)?, dev_ptr(s_rel, srl)?, out_ptr(&out)?);
+        let (r, k) = (rows as u64, self.k as u64);
+        let mut b = func.builder();
+        b.arg(&qp).arg(&srp).arg(&cbp).arg(&op).arg(&r).arg(&k);
+        unsafe { b.launch(grid_for(n)) }.w()?;
+        Ok((out, Shape::from((rows, self.k))))
+    }
+}
+
+pub fn dequant_w4a8_to_i8(q: &Tensor, s_rel: &Tensor, cb: &Tensor, k: usize) -> Result<Tensor> {
+    q.apply_op2_no_bwd(s_rel, &DequantW4A8ToI8 { cb: cb.clone(), k })
+}
+
+struct DequantW4A8 {
+    cb: Tensor,
+    k: usize,
+    out: DType,
+}
+impl CustomOp3 for DequantW4A8 {
+    fn name(&self) -> &'static str {
+        "dequant_w4a8"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("dequant_w4a8: cuda only")
+    }
+    fn cuda_fwd(
+        &self,
+        q: &CudaStorage,
+        ql: &Layout,
+        s_rel: &CudaStorage,
+        srl: &Layout,
+        s_channel: &CudaStorage,
+        scl: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        need_contig(ql, "w4a8 q")?;
+        need_contig(srl, "w4a8 s_rel")?;
+        need_contig(scl, "w4a8 s_channel")?;
+        let rows = ql.shape().dims()[0];
+        let n = rows * self.k;
+        let dev = q.device().clone();
+        let func = dev.get_or_load_custom_func("dequant_w4a8", MODULE, ptx()?)?;
+        let out = alloc_out(&dev, self.out, n)?;
+        let (cb_storage, cb_layout) = self.cb.storage_and_layout();
+        let cbp = match &*cb_storage {
+            Storage::Cuda(c) => dev_ptr(c, cb_layout)?,
+            _ => candle_core::bail!("w4a8 codebook must be on cuda"),
+        };
+        let (qp, srp, scp, op) = (dev_ptr(q, ql)?, dev_ptr(s_rel, srl)?, dev_ptr(s_channel, scl)?, out_ptr(&out)?);
+        let (r, k, ok) = (rows as u64, self.k as u64, kind_of(self.out)?);
+        let mut b = func.builder();
+        b.arg(&qp).arg(&srp).arg(&scp).arg(&cbp).arg(&op).arg(&r).arg(&k).arg(&ok);
+        unsafe { b.launch(grid_for(n)) }.w()?;
+        Ok((out, Shape::from((rows, self.k))))
+    }
+}
+
+pub fn dequant_w4a8(q: &Tensor, s_rel: &Tensor, s_channel: &Tensor, cb: &Tensor, k: usize, out: DType) -> Result<Tensor> {
+    q.apply_op3_no_bwd(s_rel, s_channel, &DequantW4A8 { cb: cb.clone(), k, out })
+}
+
 pub fn dequant_nvfp4(q: &Tensor, block_scale: &Tensor, global: &Tensor, out: DType) -> Result<Tensor> {
     let k = q.dim(1)? * 2;
     q.apply_op3_no_bwd(block_scale, &global.to_dtype(DType::F32)?.reshape(1)?, &DequantNvfp4 { out, k })

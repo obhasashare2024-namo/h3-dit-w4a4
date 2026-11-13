@@ -354,7 +354,14 @@ fn ptx(arch: &str) -> Result<&'static str> {
             options: vec!["--std=c++17".into()],
             ..Default::default()
         };
-        candle_core::cuda_backend::cudarc::nvrtc::compile_ptx_with_opts(SRC, opts).map(|p| p.to_src()).map_err(|e| format!("nvrtc attn8: {e:?}"))
+        candle_core::cuda_backend::cudarc::nvrtc::compile_ptx_with_opts(SRC, opts).map(|p| {
+            let src = p.to_src();
+            if src.contains(".version 9.4") {
+                src.replace(".version 9.4", ".version 9.3")
+            } else {
+                src
+            }
+        }).map_err(|e| format!("nvrtc attn8: {e:?}"))
     });
     r.as_deref().map_err(|e| candle_core::Error::Msg(e.clone()))
 }

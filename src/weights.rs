@@ -29,11 +29,154 @@ pub struct SafeFile {
     pub metadata: HashMap<String, String>,
 }
 
+
+fn read_gguf_val(mmap: &[u8], mut pos: usize, val_type: u32) -> Result<(String, usize)> {
+    match val_type {
+        0 => Ok((mmap[pos].to_string(), pos + 1)),
+        1 => Ok(((mmap[pos] as i8).to_string(), pos + 1)),
+        2 => {
+            let v = u16::from_le_bytes(mmap[pos..pos+2].try_into()?);
+            Ok((v.to_string(), pos + 2))
+        }
+        3 => {
+            let v = i16::from_le_bytes(mmap[pos..pos+2].try_into()?);
+            Ok((v.to_string(), pos + 2))
+        }
+        4 => {
+            let v = u32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+            Ok((v.to_string(), pos + 4))
+        }
+        5 => {
+            let v = i32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+            Ok((v.to_string(), pos + 4))
+        }
+        6 => {
+            let v = f32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+            Ok((v.to_string(), pos + 4))
+        }
+        7 => {
+            let v = mmap[pos] != 0;
+            Ok((v.to_string(), pos + 1))
+        }
+        8 => {
+            let len = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
+            pos += 8;
+            let s = std::str::from_utf8(&mmap[pos..pos+len])?.to_string();
+            Ok((s, pos + len))
+        }
+        9 => {
+            let elem_type = u32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+            pos += 4;
+            let len = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
+            pos += 8;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                let (item_str, new_p) = read_gguf_val(mmap, pos, elem_type)?;
+                items.push(item_str);
+                pos = new_p;
+            }
+            Ok((format!("[{}]", items.join(", ")), pos))
+        }
+        10 => {
+            let v = u64::from_le_bytes(mmap[pos..pos+8].try_into()?);
+            Ok((v.to_string(), pos + 8))
+        }
+        11 => {
+            let v = i64::from_le_bytes(mmap[pos..pos+8].try_into()?);
+            Ok((v.to_string(), pos + 8))
+        }
+        12 => {
+            let v = f64::from_le_bytes(mmap[pos..pos+8].try_into()?);
+            Ok((v.to_string(), pos + 8))
+        }
+        t => bail!("unsupported gguf val_type {t}"),
+    }
+}
+
+fn parse_gguf(mmap: &[u8]) -> Result<(usize, HashMap<String, TensorInfo>, HashMap<String, String>)> {
+    if mmap.len() < 24 || &mmap[..4] != b"GGUF" {
+        bail!("not a valid GGUF file");
+    }
+    let _version = u32::from_le_bytes(mmap[4..8].try_into()?);
+    let tensor_count = u64::from_le_bytes(mmap[8..16].try_into()?) as usize;
+    let metadata_kv_count = u64::from_le_bytes(mmap[16..24].try_into()?) as usize;
+
+    let mut pos = 24;
+    let mut metadata = HashMap::new();
+    let mut alignment = 32usize;
+
+    for _ in 0..metadata_kv_count {
+        let key_len = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
+        pos += 8;
+        let key = std::str::from_utf8(&mmap[pos..pos+key_len])?.to_string();
+        pos += key_len;
+        let val_type = u32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+        pos += 4;
+        let (val_str, new_pos) = read_gguf_val(mmap, pos, val_type)?;
+        pos = new_pos;
+        if key == "general.alignment" {
+            if let Ok(a) = val_str.parse::<usize>() {
+                alignment = a;
+            }
+        }
+        metadata.insert(key, val_str);
+    }
+
+    let mut tensors = HashMap::new();
+    for _ in 0..tensor_count {
+        let name_len = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
+        pos += 8;
+        let name = std::str::from_utf8(&mmap[pos..pos+name_len])?.to_string();
+        pos += name_len;
+        let n_dims = u32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+        pos += 4;
+        let mut dims = Vec::with_capacity(n_dims as usize);
+        let mut num_elements = 1usize;
+        for _ in 0..n_dims {
+            let d = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
+            pos += 8;
+            dims.push(d);
+            num_elements *= d;
+        }
+        dims.reverse();
+
+        let type_id = u32::from_le_bytes(mmap[pos..pos+4].try_into()?);
+        pos += 4;
+        let offset = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
+        pos += 8;
+
+        let (dtype_str, byte_size) = match type_id {
+            0 => ("F32", num_elements * 4),
+            1 => ("F16", num_elements * 2),
+            16 => ("I8", num_elements * 1),
+            17 => ("I16", num_elements * 2),
+            18 => ("I32", num_elements * 4),
+            19 => ("I64", num_elements * 8),
+            29 | 30 => ("BF16", num_elements * 2),
+            t => bail!("unsupported gguf tensor type {t}"),
+        };
+
+        let k = name.strip_prefix("model.diffusion_model.").map(str::to_string).unwrap_or(name);
+        tensors.insert(k, TensorInfo {
+            dtype: dtype_str.to_string(),
+            shape: dims,
+            start: offset,
+            end: offset + byte_size,
+        });
+    }
+
+    let data_start = (pos + alignment - 1) / alignment * alignment;
+    Ok((data_start, tensors, metadata))
+}
 impl SafeFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let path = path.as_ref();
         let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
+        if mmap.len() >= 4 && &mmap[..4] == b"GGUF" {
+            let (data_start, tensors, metadata) = parse_gguf(&mmap)?;
+            return Ok(Arc::new(Self { path: path.display().to_string(), fh: file, mmap, data_start, tensors, metadata }));
+        }
         let n = u64::from_le_bytes(mmap[..8].try_into()?) as usize;
         let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&mmap[8..8 + n])?;
         let mut tensors = HashMap::new();
@@ -131,10 +274,17 @@ impl SafeFile {
     /// Parse the `<prefix>.comfy_quant` JSON blob, if any.
     pub fn comfy_quant(&self, prefix: &str) -> Result<Option<serde_json::Value>> {
         let key = format!("{prefix}.comfy_quant");
-        if !self.has(&key) {
-            return Ok(None);
+        if self.has(&key) {
+            return Ok(Some(serde_json::from_slice(self.bytes(&key)?)?));
         }
-        Ok(Some(serde_json::from_slice(self.bytes(&key)?)?))
+        if let Some(meta_str) = self.metadata.get("_quantization_metadata") {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                if let Some(layer_conf) = meta.get("layers").and_then(|l| l.get(prefix)) {
+                    return Ok(Some(layer_conf.clone()));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -385,7 +535,7 @@ impl Held {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum QFormat {
     /// Plain floating point weight.
     Dense,
@@ -394,6 +544,8 @@ pub enum QFormat {
     Int8 { convrot: Option<usize> },
     /// NVFP4 (e2m1 + fp8 e4m3 block-16 scales + f32 global), optional AWQ input smoothing.
     Nvfp4,
+    /// Asymmetric W4A8 INT8 with Lloyd-Max codebook, group-16 FP8 relative scale, and Hadamard-256 ConvRot.
+    AsymW4A8 { convrot: Option<usize>, group_size: usize, codebook: Held },
 }
 
 /// A low-rank delta `scale * B @ A` added to a linear layer's output.
@@ -516,6 +668,19 @@ impl QLinear {
                 let pq = if file.has(&pq_name) { Some(file.load_as(&pq_name, dev, compute)?) } else { None };
                 (QFormat::Nvfp4, Some(g), Some(bs), pq, wshape[1] * 2)
             }
+            Some("asym_w4a8_int8") => {
+                let c = conf.as_ref().unwrap();
+                let convrot = if c["convrot"].as_bool().unwrap_or(false) {
+                    Some(c["convrot_groupsize"].as_u64().unwrap_or(256) as usize)
+                } else {
+                    None
+                };
+                let group_size = c["group_size"].as_u64().unwrap_or(16) as usize;
+                let s_channel = Held::small(file, &format!("{prefix}.weight_s_channel"), dev)?;
+                let s_rel = Held::new(file, &format!("{prefix}.weight_s_rel"), place, dev)?;
+                let codebook = Held::small(file, &format!("{prefix}.weight_codebook"), dev)?;
+                (QFormat::AsymW4A8 { convrot, group_size, codebook }, Some(s_channel), Some(s_rel), None, wshape[1] * 2)
+            }
             Some(f) => bail!("{prefix}: unsupported quantization format {f}"),
         };
         Ok(Self {
@@ -581,14 +746,20 @@ impl QLinear {
             QFormat::Dense => w.to_dtype(dtype)?,
             QFormat::Int8 { .. } => kernels::dequant_i8(w, &self.scale.as_ref().unwrap().get(dev)?, dtype)?,
             QFormat::Nvfp4 => kernels::dequant_nvfp4(w, raw.bs.as_ref().unwrap(), &self.scale.as_ref().unwrap().get(dev)?, dtype)?,
+            QFormat::AsymW4A8 { codebook, .. } => {
+                let cb = codebook.get(dev)?;
+                let s_rel = raw.bs.as_ref().context("AsymW4A8 requires s_rel")?;
+                let s_channel = self.scale.as_ref().unwrap().get(dev)?;
+                kernels::dequant_w4a8(w, s_rel, &s_channel, &cb, self.in_features, dtype)?
+            }
         })
     }
 
     /// Dequantized weight in the plain (unrotated) basis.
     pub fn dequant_plain(&self, dev: &Device, dtype: DType) -> Result<Tensor> {
         let w = self.dequant(dev, DType::F32)?;
-        let w = match self.fmt {
-            QFormat::Int8 { convrot: Some(g) } => rotate_activation(&w, g)?,
+        let w = match &self.fmt {
+            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
             _ => w,
         };
         Ok(w.to_dtype(dtype)?)
@@ -626,7 +797,7 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } => rotate_activation(&xc, g)?,
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
                 _ => xc.clone(),
             };
             let mut y = xr.matmul(&wt)?;
@@ -706,7 +877,7 @@ impl QLinear {
             Ok(acc.unwrap())
         };
         match self.fmt {
-            QFormat::Nvfp4 => return Ok(()), // keep the runtime path for nvfp4
+            QFormat::Nvfp4 | QFormat::AsymW4A8 { .. } => return Ok(()), // keep the runtime path for nvfp4 and w4a8
             QFormat::Dense => {
                 let w = self.weight.get(dev)?;
                 let dt = w.dtype();
@@ -835,8 +1006,14 @@ impl QLinear {
         if matches!(self.fmt, QFormat::Int8 { .. }) && dev.is_metal() && self.in_features % 64 == 0 {
             return Ok(Prepared::Mlx(crate::apple::Int8Weight::new(&raw.w, &self.scale.as_ref().unwrap().get(dev)?)?));
         }
-        Ok(match self.fmt {
+        Ok(match &self.fmt {
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
+            QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
+                let cb = codebook.get(dev)?;
+                let s_rel = raw.bs.as_ref().context("AsymW4A8 requires s_rel")?;
+                let w_i8 = kernels::dequant_w4a8_to_i8(&raw.w, s_rel, &cb, self.in_features)?;
+                Prepared::Int8(Raw { w: w_i8, bs: None })
+            }
             _ => Prepared::Deq(self.dequant_raw(&raw, dev, dtype)?),
         })
     }
@@ -872,9 +1049,9 @@ impl QLinear {
                 let rows = x.elem_count() / k;
                 let x2 = x.reshape((rows, k))?;
                 let dev = x.device();
-                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } if kernels::can_fuse_rotation(k, g));
+                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
                 let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
-                    QFormat::Int8 { convrot: Some(g) } if !fuse => rotate_activation(&x2, g),
+                    QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fuse => rotate_activation(&x2, g),
                     _ => Ok(x2),
                 })?;
                 let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -896,9 +1073,9 @@ impl QLinear {
         let rows = x.elem_count() / k;
         let x2 = x.reshape((rows, k))?;
         // the warp-level rotation is fused into the quantizer (group 256, K <= 56 groups)
-        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
+        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) } | QFormat::AsymW4A8 { convrot: Some(256), .. }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
         let xr = match self.fmt {
-            QFormat::Int8 { convrot: Some(g) } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
+            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
             _ => x2,
         };
         let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -927,9 +1104,9 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let dev = x.device();
-            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } if kernels::can_fuse_rotation(k, g));
+            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
             let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } if !fuse => rotate_activation(&xc, g),
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fuse => rotate_activation(&xc, g),
                 _ => Ok(xc.clone()),
             })?;
             let mut y = crate::dit::prof::time("  int8 gemm", dev, || kernels::int8_linear_ex(&xr, &raw.w, &scale, self.bias.as_ref(), x.dtype(), false, fuse))?;
@@ -968,7 +1145,7 @@ impl QLinear {
         for start in (0..rows).step_by(chunk.max(1)) {
             let xc = x2.narrow(0, start, chunk.max(1).min(rows-start))?;
             let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } => rotate_activation(&xc, g)?,
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
                 _ => xc.clone(),
             };
             let mut y = w.forward(&xr)?;

@@ -77,3 +77,15 @@ required-features = ["cuda"]
 [[example]]
 name = "gemm_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "test_w4a8"
+required-features = ["cuda"]
+
+[[example]]
+name = "test_gguf_w4a8"
+required-features = ["cuda"]
+
+[[example]]
+name = "parity_check"
+required-features = ["cuda"]
