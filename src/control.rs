@@ -106,14 +106,14 @@ impl Control {
                 norm2: ld("norm2.weight")?,
                 q_norm: ld("attn.q_norm.weight")?,
                 k_norm: ld("attn.k_norm.weight")?,
-                qkv: QLinear::load(&f, &format!("{p}.attn.qkv_proj"), place, dev, dtype)?,
-                out: QLinear::load(&f, &format!("{p}.attn.out_proj"), place, dev, dtype)?,
-                fc1: QLinear::load(&f, &format!("{p}.mlp.fc1"), place, dev, dtype)?,
-                fc2: QLinear::load(&f, &format!("{p}.mlp.fc2"), place, dev, dtype)?,
+                qkv: crate::dit::QkvProj::Fused(QLinear::load(&f, &format!("{p}.attn.qkv_proj"), place, dev, dtype)?),
+                out: crate::dit::LinProj::Single(QLinear::load(&f, &format!("{p}.attn.out_proj"), place, dev, dtype)?),
+                fc1: crate::dit::LinProj::Single(QLinear::load(&f, &format!("{p}.mlp.fc1"), place, dev, dtype)?),
+                fc2: crate::dit::LinProj::Single(QLinear::load(&f, &format!("{p}.mlp.fc2"), place, dev, dtype)?),
                 adaln: ad,
             });
             if crate::weights::int8_enabled() {
-                blocks[i].fc1.interleave_swiglu()?;
+                if let crate::dit::LinProj::Single(fc1) = &mut blocks[i].fc1 { fc1.interleave_swiglu()?; }
             }
             after.push(QLinear::load(&f, &format!("{p}.after_proj"), Placement::Gpu, dev, dtype)?);
         }
@@ -176,7 +176,7 @@ impl Control {
     /// Control block `ci` on the stream; returns the new stream and the residual for the base stream.
     pub(crate) fn step(&self, dit: &Dit, ci: usize, c: Tensor, cx: &StepCtx) -> Result<(Tensor, Tensor)> {
         let b = &self.blocks[ci];
-        let raws = [b.qkv.fetch(&self.dev)?, b.out.fetch(&self.dev)?, b.fc1.fetch(&self.dev)?, b.fc2.fetch(&self.dev)?];
+        let raws = match (&b.qkv, &b.out, &b.fc1, &b.fc2) { (crate::dit::QkvProj::Fused(qkv), crate::dit::LinProj::Single(out), crate::dit::LinProj::Single(fc1), crate::dit::LinProj::Single(fc2)) => Some([qkv.fetch(&self.dev)?, out.fetch(&self.dev)?, fc1.fetch(&self.dev)?, fc2.fetch(&self.dev)?]), _ => None };
         let c = dit.run_block(b, raws, c, cx)?;
         let skip = self.after[ci].forward(&c)?;
         Ok((c, skip))
