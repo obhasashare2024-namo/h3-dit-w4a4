@@ -1804,6 +1804,30 @@ pub fn rms_modulate(x: &Tensor, w: &Tensor, eps: f32, scale: &Tensor, shift: &Te
     x.contiguous()?.apply_op2_no_bwd(&scale.contiguous()?, &op)
 }
 
+/// In-place RMSNorm + Modulate: .
+pub fn rms_modulate_inplace(x: &Tensor, w: &Tensor, eps: f32, scale: &Tensor, shift: &Tensor, idx: &Tensor) -> Result<()> {
+    let (s, c) = x.dims2()?;
+    let (st_x, lx) = x.storage_and_layout();
+    need_contig(lx, "rms_modulate_inplace x")?;
+    match &*st_x {
+        Storage::Cuda(cx) => {
+            let dev = cx.device().clone();
+            let f = dev.get_or_load_custom_func("rms_modulate", MODULE, ptx()?)?;
+            let xp = dev_ptr(cx, lx)?;
+            let wp = cuda_ptr_of(&w.to_dtype(x.dtype())?.contiguous()?)?;
+            let sp = cuda_ptr_of(&scale.contiguous()?)?;
+            let shp = cuda_ptr_of(&shift.contiguous()?)?;
+            let ip = cuda_ptr_of(&idx.contiguous()?)?;
+            let (k, ci) = (kind_of(x.dtype())?, c as i32);
+            let mut b = f.builder();
+            b.arg(&xp).arg(&k).arg(&wp).arg(&eps).arg(&sp).arg(&shp).arg(&ip).arg(&xp).arg(&ci);
+            unsafe { b.launch(LaunchConfig { grid_dim: (s as u32, 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 }) }.w()?;
+            Ok(())
+        }
+        _ => candle_core::bail!("rms_modulate_inplace: cuda only"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // latent upscaler kernels (see `upscaler.rs`); tensors are frames-first `[T, C, H, W]`.
 

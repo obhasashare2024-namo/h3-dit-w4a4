@@ -554,6 +554,28 @@ fn dense_f32(f: &Arc<SafeFile>, prefix: &str, dev: &Device) -> Result<QLinear> {
     Ok(l)
 }
 
+fn cpu_chunk_to_device(t: &Tensor, dev: &Device) -> Result<Tensor> {
+    if t.device().is_cuda() {
+        return Ok(t.clone());
+    }
+    let shape = t.shape().clone();
+    let flat = t.flatten_all()?;
+    match t.dtype() {
+        DType::BF16 => {
+            let v = flat.to_vec1::<half::bf16>()?;
+            Ok(Tensor::from_vec(v, shape, dev)?)
+        }
+        DType::F16 => {
+            let v = flat.to_vec1::<half::f16>()?;
+            Ok(Tensor::from_vec(v, shape, dev)?)
+        }
+        _ => {
+            let v = flat.to_vec1::<f32>()?;
+            Ok(Tensor::from_vec(v, shape, dev)?)
+        }
+    }
+}
+
 impl Dit {
     pub fn load(path: &str, dev: &Device, mem: &MemoryConfig, lora: Option<(&Lora, f64)>) -> Result<Self> {
         let f = SafeFile::open(path)?;
@@ -967,27 +989,43 @@ impl Dit {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let (hg, w) = (h / groups, h / groups * d);
         let s = n1.dim(0)?;
+        let chunk = self.mem.token_chunk.max(1);
+        println!("[attend_factorized] start: s={}, groups={}, w={}, chunk={}, free VRAM={:.2} GB", s, groups, w, chunk, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
 
-        let mid_q = prof::time("q down", &self.dev, || q.down.forward(&n1))?;
-        let mid_k = prof::time("k down", &self.dev, || k.down.forward(&n1))?;
-        let mid_v = prof::time("v down", &self.dev, || v.down.forward(&n1))?;
-        drop(n1);
+        let (mid_q, mid_k, mid_v) = if s > 30000 {
+            let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
+            let mid_k_cpu = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
+            let mid_v_cpu = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
+            drop(n1);
+            println!("[attend_factorized] down projections done on CPU, n1 dropped, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+            let mid_q = mid_q_cpu.to_device(&self.dev)?;
+            let mid_k = mid_k_cpu.to_device(&self.dev)?;
+            let mid_v = mid_v_cpu.to_device(&self.dev)?;
+            println!("[attend_factorized] mid_q/k/v reloaded to GPU, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+            (mid_q, mid_k, mid_v)
+        } else {
+            let mid_q = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?;
+            let mid_k = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?;
+            let mid_v = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?;
+            drop(n1);
+            (mid_q, mid_k, mid_v)
+        };
 
         let mut outs = Vec::with_capacity(groups);
         for g in 0..groups {
             let r0 = g * w;
             let q_up = q.up.rows(r0, w, &self.dev)?;
-            let qt = prof::time("q up", &self.dev, || q_up.forward(&mid_q))?;
+            let qt = prof::time("q up", &self.dev, || q_up.forward_chunked(&mid_q, chunk))?;
             let q_norm = kernels::qk_norm_rope(&qt, 0, hg, d, Some((Some(&b.q_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
             drop(qt);
 
             let k_up = k.up.rows(r0, w, &self.dev)?;
-            let kt = prof::time("k up", &self.dev, || k_up.forward(&mid_k))?;
+            let kt = prof::time("k up", &self.dev, || k_up.forward_chunked(&mid_k, chunk))?;
             let k_norm = kernels::qk_norm_rope(&kt, 0, hg, d, Some((Some(&b.k_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
             drop(kt);
 
             let v_up = v.up.rows(r0, w, &self.dev)?;
-            let vt = prof::time("v up", &self.dev, || v_up.forward(&mid_v))?;
+            let vt = prof::time("v up", &self.dev, || v_up.forward_chunked(&mid_v, chunk))?;
 
             let o = prof::time("attention", &self.dev, || -> Result<Tensor> {
                 let prefer_flash = std::env::var("H3_ATTN").map(|v| v != "int8" && v != "attn8").unwrap_or(true);
@@ -1293,15 +1331,19 @@ impl Dit {
                 }
             }
         };
-        let mut x_holder = Some(x);
-        let n1 = {
-            let x_ref = x_holder.as_ref().unwrap();
-            prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?
-        };
-        let (x_saved, dev_ref) = if x_holder.as_ref().unwrap().dim(0)? > 30000 {
-            (Some(x_holder.take().unwrap().to_device(&Device::Cpu)?), dev)
+        let (n1, x_saved, mut x_holder, dev_ref) = if x.dim(0)? > 30000 {
+            println!("[dit] run_block: offloading x to CPU (IN-PLACE NORM1), free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+            let x_cpu = prof::time("offload x", dev, || x.to_device(&Device::Cpu))?;
+            prof::time("norm/mod in-place", dev, || kernels::rms_modulate_inplace(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx))?;
+            println!("[dit] run_block: x modulated in-place -> n1, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+            (x, Some(x_cpu), None, dev)
         } else {
-            (None, dev)
+            let mut x_h = Some(x);
+            let n1 = {
+                let x_ref = x_h.as_ref().unwrap();
+                prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?
+            };
+            (n1, None, x_h, dev)
         };
         let att = match &b.qkv {
             QkvProj::Fused(qkv) if groups > 1 => {
@@ -1342,14 +1384,19 @@ impl Dit {
                         let mut st = 0;
                         while st < s {
                             let n = chunk.min(s - st);
+                            println!("[out linear in-place] st={}, n={}, free VRAM={:.2} GB", st, n, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+                            println!("[out linear in-place] step 1: narrow");
                             let chunk_x = x.narrow(0, st, n)?;
                             let chunk_idx = cx.idx.narrow(0, st, n)?;
-                            let chunk_att_raw = att.narrow(0, st, n)?;
-                            let chunk_att = if chunk_att_raw.device().is_cuda() { chunk_att_raw } else { chunk_att_raw.to_device(dev)? };
+                            let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
+                            let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
+                            println!("[out linear in-place] step 3: forward_raw");
                             let yc = out.forward_raw(&chunk_att, r_out, chunk)?;
                             drop(chunk_att);
+                            println!("[out linear in-place] step 4: gate_add_inplace");
                             kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
                             drop(yc);
+                            println!("[out linear in-place] step 5: done chunk");
                             st += n;
                         }
                     }
@@ -1360,8 +1407,8 @@ impl Dit {
                             let n = chunk.min(s - st);
                             let chunk_x = x.narrow(0, st, n)?;
                             let chunk_idx = cx.idx.narrow(0, st, n)?;
-                            let chunk_att_raw = att.narrow(0, st, n)?;
-                            let chunk_att = if chunk_att_raw.device().is_cuda() { chunk_att_raw } else { chunk_att_raw.to_device(dev)? };
+                            let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
+                            let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
                             let yc = out.forward_raw(&chunk_att, &r_out, chunk)?;
                             drop(chunk_att);
                             kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
@@ -1375,8 +1422,8 @@ impl Dit {
                             let n = chunk.min(s - st);
                             let chunk_x = x.narrow(0, st, n)?;
                             let chunk_idx = cx.idx.narrow(0, st, n)?;
-                            let chunk_att_raw = att.narrow(0, st, n)?;
-                            let chunk_att = if chunk_att_raw.device().is_cuda() { chunk_att_raw } else { chunk_att_raw.to_device(dev)? };
+                            let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
+                            let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
                             let mid = lr.down.forward(&chunk_att)?;
                             drop(chunk_att);
                             let yc = lr.up.forward(&mid)?;
