@@ -27,7 +27,7 @@
 // 將單個 FP32 數值量化為 [-8, 7] 的 4-bit 二補數 nibble (0x0 ~ 0xF)
 __device__ __forceinline__ uint32_t quantize_f32_to_s4_nibble(float x, float inv_scale) {
     int32_t q = __float2int_rn(x * inv_scale);
-    q = max(-8, min(7, q));
+    q = max(-7, min(7, q));
     return static_cast<uint32_t>(q & 0xF);
 }
 
@@ -159,9 +159,9 @@ __global__ void rmsnorm_fwht256_quant_s4_kernel(
             max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffffu, max_abs, mask));
         }
 
-        // 對稱映射至 [-8, 7] (除以 7.5f 並夾斷至 [-8, 7])
-        float scale = max_abs / 7.5f;
-        float inv_scale = 7.5f / max_abs;
+        // sp001 審核優化：對稱映射至 [-7, 7] (除以 7.0f，確保正負峰值無偏，且下界防 FP16 下溢)
+        float scale = fmaxf(max_abs / 7.0f, 1e-4f);
+        float inv_scale = 1.0f / scale;
 
         uint32_t packed_s4 = pack_f32x8_to_s4x8(v, inv_scale);
 

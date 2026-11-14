@@ -623,7 +623,7 @@ __device__ __forceinline__ u32 pack_f32x8_to_s4x8(const float v[8], float inv_sc
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         int q = __float2int_rn(v[i] * inv_scale);
-        q = max(-8, min(7, q));
+        q = max(-7, min(7, q));
         packed |= (((u32)(q & 0xF)) << (i * 4));
     }
     return packed;
@@ -662,8 +662,9 @@ extern "C" __global__ void quant_act_w4a4_group256(
         max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffffu, max_abs, mask));
     }
 
-    float scale = max_abs / 7.5f;
-    float inv_scale = 7.5f / max_abs;
+    // sp001 審核優化：對稱映射至 [-7, 7]，消除 -6.67% 峰值偏差；下界防範 FP16 下溢
+    float scale = fmaxf(max_abs / 7.0f, 1e-4f);
+    float inv_scale = 1.0f / scale;
 
     u32 packed = pack_f32x8_to_s4x8(v, inv_scale);
     A_packed[(size_t)m * (K >> 3) + (g << 5) + lane_id] = packed;
@@ -1821,6 +1822,9 @@ impl CustomOp3 for GemmW4A4Preswizzled {
         need_contig(wsl, "w4a4 ws")?;
         let (m, k) = xl.shape().dims2()?;
         let n = self.out_features;
+        if n % 8 != 0 || k % 256 != 0 {
+            candle_core::bail!("gemm_w4a4_preswizzled requires N to be a multiple of 8 and K to be a multiple of 256 (got N={n}, K={k})");
+        }
         let dev = x.device().clone();
 
         let ptx_code = ptx()?;
