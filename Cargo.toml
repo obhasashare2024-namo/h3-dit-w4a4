@@ -1,12 +1,12 @@
 [package]
-name = "h3-rs"
+name = "h3-dit-w4a4"
 version = "0.5.3"
 edition = "2021"
 # ntex 4 (the `serve` feature) needs 1.97
 rust-version = "1.97"
-description = "MiniMax H3 text/image-to-video with stereo audio in Rust (CUDA or Apple Silicon MLX)"
+description = "MiniMax H3 DiT in Pure Rust with Ampere sm_86 Native INT4 Tensor Core (135 TOPS) & 3-Tier Streaming"
 license = "Apache-2.0"
-repository = "https://github.com/apiplant/h3-rs"
+repository = "https://github.com/obhasashare2024-namo/h3-dit-w4a4"
 homepage = "https://h3-rs.apiplant.com"
 readme = "README.md"
 keywords = ["video-generation", "diffusion", "cuda", "minimax", "candle"]
@@ -96,5 +96,10 @@ required-features = ["cuda"]
 
 [[bin]]
 name = "server_9411"
+path = "src/bin/server_9411.rs"
+required-features = ["serve", "cuda"]
+
+[[bin]]
+name = "server_9412"
 path = "src/bin/server_9411.rs"
 required-features = ["serve", "cuda"]
