@@ -277,6 +277,19 @@ impl SafeFile {
         if self.has(&key) {
             return Ok(Some(serde_json::from_slice(self.bytes(&key)?)?));
         }
+        if let Some(fmt) = self.metadata.get("h3.quant.format") {
+            if fmt == "ampere_w4a4_group256_preswizzled" {
+                let s_name = format!("{prefix}.weight_scale");
+                if self.has(&s_name) {
+                    return Ok(Some(serde_json::json!({
+                        "format": "ampere_w4a4_group256_preswizzled",
+                        "convrot": true,
+                        "convrot_groupsize": 256,
+                        "group_size": 256
+                    })));
+                }
+            }
+        }
         if let Some(meta_str) = self.metadata.get("_quantization_metadata") {
             if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
                 if let Some(layer_conf) = meta.get("layers").and_then(|l| l.get(prefix)) {
@@ -548,6 +561,8 @@ pub enum QFormat {
     AsymW4A8 { convrot: Option<usize>, group_size: usize, codebook: Held },
     /// Symmetric W4A4 INT4 with Group-256 FP16 scale and Hadamard-256 ConvRot.
     SymW4A4 { convrot: Option<usize>, group_size: usize },
+    /// Ampere SM86 Preswizzled W4A4 INT4 Tensor Core format (zero dequant, native mma.m16n8k64).
+    AmpereW4A4Preswizzled { convrot: Option<usize>, group_size: usize },
 }
 
 /// A low-rank delta `scale * B @ A` added to a linear layer's output.
@@ -694,8 +709,17 @@ impl QLinear {
                 let s = Held::small(file, &format!("{prefix}.weight_scale"), dev)?;
                 (QFormat::SymW4A4 { convrot, group_size }, Some(s), None, None, wshape[1] * 2)
             }
+            Some("ampere_w4a4_group256_preswizzled") => {
+                let convrot = Some(256);
+                let group_size = 256;
+                let s = Held::small(file, &format!("{prefix}.weight_scale"), dev)?;
+                let k_in = wshape[1] * 64;
+                (QFormat::AmpereW4A4Preswizzled { convrot, group_size }, Some(s), None, None, k_in)
+            }
             Some(f) => bail!("{prefix}: unsupported quantization format {f}"),
         };
+        let is_preswizzled = matches!(fmt, QFormat::AmpereW4A4Preswizzled { .. });
+        let out_features = if is_preswizzled { wshape[0] * 8 } else { wshape[0] };
         Ok(Self {
             name: prefix.to_string(),
             fmt,
@@ -704,7 +728,7 @@ impl QLinear {
             block_scale,
             pre_quant_scale: pqs,
             bias,
-            out_features: wshape[0],
+            out_features,
             in_features,
             loras: vec![],
             interleaved: false,
@@ -769,6 +793,9 @@ impl QLinear {
                 let scale = self.scale.as_ref().unwrap().get(dev)?;
                 kernels::dequant_sym_w4a4(w, &scale, dtype)?
             }
+            QFormat::AmpereW4A4Preswizzled { .. } => {
+                bail!("AmpereW4A4Preswizzled runs natively on INT4 Tensor Cores without dequantization");
+            }
         })
     }
 
@@ -776,7 +803,7 @@ impl QLinear {
     pub fn dequant_plain(&self, dev: &Device, dtype: DType) -> Result<Tensor> {
         let w = self.dequant(dev, DType::F32)?;
         let w = match &self.fmt {
-            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
+            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } | QFormat::AmpereW4A4Preswizzled { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
             _ => w,
         };
         Ok(w.to_dtype(dtype)?)
@@ -786,6 +813,9 @@ impl QLinear {
     pub fn forward_chunked(&self, x: &Tensor, chunk: usize) -> Result<Tensor> {
         #[cfg(feature = "mlx")]
         if x.device().is_metal() && matches!(self.fmt, QFormat::Int8 { .. }) && self.in_features % 64 == 0 {
+            return self.forward_raw(x, &self.fetch(x.device())?, chunk);
+        }
+        if x.device().is_cuda() && matches!(self.fmt, QFormat::AmpereW4A4Preswizzled { .. }) {
             return self.forward_raw(x, &self.fetch(x.device())?, chunk);
         }
         let w = self.dequant(x.device(), x.dtype())?;
@@ -894,7 +924,7 @@ impl QLinear {
             Ok(acc.unwrap())
         };
         match self.fmt {
-            QFormat::Nvfp4 | QFormat::AsymW4A8 { .. } | QFormat::SymW4A4 { .. } => return Ok(()), // keep the runtime path for nvfp4 and w4a8
+            QFormat::Nvfp4 | QFormat::AsymW4A8 { .. } | QFormat::SymW4A4 { .. } | QFormat::AmpereW4A4Preswizzled { .. } => return Ok(()), // keep the runtime path for nvfp4 and w4a8
             QFormat::Dense => {
                 let w = self.weight.get(dev)?;
                 let dt = w.dtype();
@@ -1011,6 +1041,7 @@ pub fn int8_enabled() -> bool {
 
 /// A weight ready for GEMMs: raw int8 (tensor-core path) or dequantized.
 pub enum Prepared {
+    W4A4(Raw),
     Int8(Raw),
     #[cfg(feature = "mlx")]
     Mlx(crate::apple::Int8Weight),
@@ -1024,6 +1055,7 @@ impl QLinear {
             return Ok(Prepared::Mlx(crate::apple::Int8Weight::new(&raw.w, &self.scale.as_ref().unwrap().get(dev)?)?));
         }
         Ok(match &self.fmt {
+            QFormat::AmpereW4A4Preswizzled { .. } if dev.is_cuda() => Prepared::W4A4(raw),
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
             QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
                 let cb = codebook.get(dev)?;
@@ -1043,6 +1075,7 @@ impl QLinear {
 
     pub fn run(&self, x: &Tensor, p: &Prepared, chunk: usize) -> Result<Tensor> {
         match p {
+            Prepared::W4A4(raw) => self.apply_w4a4(x, raw, chunk),
             Prepared::Deq(w) => self.apply(x, w, chunk),
             Prepared::Int8(raw) => self.apply_int8(x, raw, chunk),
             #[cfg(feature = "mlx")]
@@ -1061,6 +1094,10 @@ impl QLinear {
             return swiglu_interleaved(&self.run(x, p, chunk)?);
         }
         match p {
+            Prepared::W4A4(raw) => {
+                let y = self.apply_w4a4(x, raw, chunk)?;
+                crate::ops::swiglu(&y)
+            }
             Prepared::Int8(raw) if self.loras.is_empty() => {
                 let k = x.dim(D::Minus1)?;
                 let rows = x.elem_count() / k;
@@ -1100,6 +1137,44 @@ impl QLinear {
         let mut od = x.dims().to_vec();
         *od.last_mut().unwrap() = if swiglu { self.out_features / 2 } else { self.out_features };
         Ok(Some(y.reshape(od)?))
+    }
+
+    
+    pub fn apply_w4a4(&self, x: &Tensor, raw: &Raw, chunk: usize) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let k = *dims.last().unwrap();
+        let rows = x.elem_count() / k;
+        let x2 = x.reshape((rows, k))?;
+        let x2 = match &self.pre_quant_scale {
+            Some(s) => x2.broadcast_mul(&s.to_dtype(x.dtype())?)?,
+            None => x2,
+        };
+        let dev = x.device();
+        let scale = self.scale.as_ref().unwrap().get(dev)?;
+        let chunk = chunk.max(1);
+        let mut start = 0;
+        let mut outs = vec![];
+        while start < rows {
+            let n = chunk.min(rows - start);
+            let xc = x2.narrow(0, start, n)?;
+            let xr = match self.fmt {
+                QFormat::AmpereW4A4Preswizzled { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
+                _ => xc.clone(),
+            };
+            let mut y = kernels::gemm_w4a4_preswizzled(&xr, &raw.w, &scale, self.bias.as_ref(), self.out_features)?;
+            for l in &self.loras {
+                let a = l.a.to_dtype(x.dtype())?;
+                let b = l.b.to_dtype(x.dtype())?;
+                let d = xc.matmul(&a.t()?)?.matmul(&b.t()?)?;
+                y = (y + (d * l.scale))?;
+            }
+            outs.push(y);
+            start += n;
+        }
+        let y = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
+        let mut od = dims;
+        *od.last_mut().unwrap() = self.out_features;
+        Ok(y.reshape(od)?)
     }
 
     fn apply_int8(&self, x: &Tensor, raw: &Raw, chunk: usize) -> Result<Tensor> {

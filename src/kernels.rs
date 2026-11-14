@@ -587,6 +587,271 @@ extern "C" __global__ void bilinear_hw(const void* x, int kind, void* out, unsig
         stf(out, kind, i, (a * (1.f - lx) + bb * lx) * (1.f - ly) + (c * (1.f - lx) + d * lx) * ly);
     }
 }
+
+struct U2 { u32 x, y; };
+struct U4 { u32 x, y, z, w; };
+
+__device__ __forceinline__ u32 smem_u32(const void* p) {
+    u32 a; asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p)); return a;
+}
+
+__device__ __forceinline__ void ptx_ldmatrix_x4(u32 a[4], const void* p) {
+    u32 addr = smem_u32(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void ptx_mma_m16n8k64_s4(
+    int d[4], const u32 a[4], const u32 b[2], const int c[4]
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3])
+    );
+}
+
+__device__ __forceinline__ u32 pack_f32x8_to_s4x8(const float v[8], float inv_scale) {
+    u32 packed = 0u;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int q = __float2int_rn(v[i] * inv_scale);
+        q = max(-8, min(7, q));
+        packed |= (((u32)(q & 0xF)) << (i * 4));
+    }
+    return packed;
+}
+
+extern "C" __global__ void quant_act_w4a4_group256(
+    const u16* __restrict__ X,
+    u32* __restrict__ A_packed,
+    u16* __restrict__ S_x,
+    int M, int K
+) {
+    int num_groups = K >> 8;
+    int total_groups = M * num_groups;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int group_idx = tid >> 5;
+    int lane_id = tid & 31;
+
+    if (group_idx >= total_groups) return;
+
+    int m = group_idx / num_groups;
+    int g = group_idx % num_groups;
+
+    int k_base = (g << 8) + (lane_id << 3);
+    const u16* x_ptr = X + (size_t)m * K + k_base;
+
+    float v[8];
+    float max_abs = 1e-7f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = bf2f(x_ptr[i]);
+        max_abs = fmaxf(max_abs, fabsf(v[i]));
+    }
+
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffffu, max_abs, mask));
+    }
+
+    float scale = max_abs / 7.5f;
+    float inv_scale = 7.5f / max_abs;
+
+    u32 packed = pack_f32x8_to_s4x8(v, inv_scale);
+    A_packed[(size_t)m * (K >> 3) + (g << 5) + lane_id] = packed;
+    if (lane_id == 0) {
+        S_x[(size_t)m * num_groups + g] = f2h(scale);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 2)
+void ampere_w4a4_group256_gemm_sm86(
+    const u32* __restrict__ A_packed,
+    const U2* __restrict__ B_preswizzled,
+    const u16* __restrict__ S_x,
+    const u16* __restrict__ S_w,
+    u16* __restrict__ Y_out,
+    int M, int N, int K
+) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK_U32 = 32;
+    constexpr int SMEM_A_STRIDE = BK_U32 + 4;
+
+    __shared__ alignas(16) u32 s_A[BM][SMEM_A_STRIDE];
+    __shared__ alignas(16) U2  s_B[8][4][32];
+    __shared__ float s_scale_x[BM];
+    __shared__ float s_scale_w[BN];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
+
+    const int warp_m_idx = warp_id >> 1;
+    const int warp_n_idx = warp_id & 1;
+
+    const int cta_m_base = blockIdx.y * BM;
+    const int cta_n_base = blockIdx.x * BN;
+
+    const int num_groups = K >> 8;
+    const int k_u32_global_stride = K >> 3;
+    const int k_tile64_global_stride = K >> 6;
+
+    const int group_id = lane_id >> 2;
+    const int tid_in_group = lane_id & 3;
+
+    float acc_f32[2][4][4];
+    #pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                acc_f32[mi][ni][r] = 0.0f;
+            }
+        }
+    }
+
+    for (int g = 0; g < num_groups; ++g) {
+        #pragma unroll
+        for (int load_idx = tid; load_idx < (BM * (BK_U32 / 4)); load_idx += 128) {
+            int row = load_idx >> 3;
+            int col_u32 = (load_idx & 7) << 2;
+            int global_m = cta_m_base + row;
+            int global_k_u32 = (g << 5) + col_u32;
+
+            U4 vec_a = {0u, 0u, 0u, 0u};
+            if (global_m < M) {
+                vec_a = *reinterpret_cast<const U4*>(
+                    &A_packed[(size_t)global_m * k_u32_global_stride + global_k_u32]
+                );
+            }
+            *reinterpret_cast<U4*>(&s_A[row][col_u32]) = vec_a;
+        }
+
+        #pragma unroll
+        for (int load_idx = tid; load_idx < (8 * 4 * 32); load_idx += 128) {
+            int n_tile_local = load_idx >> 7;
+            int k_step_local = (load_idx >> 5) & 3;
+            int l_id         = load_idx & 31;
+
+            int global_n_tile = (cta_n_base >> 3) + n_tile_local;
+            int global_k_tile = (g << 2) + k_step_local;
+
+            U2 val_b = {0u, 0u};
+            if ((global_n_tile << 3) < N) {
+                size_t b_offset = ((size_t)global_n_tile * k_tile64_global_stride + global_k_tile) * 32 + l_id;
+                val_b = B_preswizzled[b_offset];
+            }
+            s_B[n_tile_local][k_step_local][l_id] = val_b;
+        }
+
+        if (tid < BM) {
+            int gm = cta_m_base + tid;
+            s_scale_x[tid] = (gm < M) ? h2f(S_x[(size_t)gm * num_groups + g]) : 0.0f;
+        } else if (tid < BM + BN) {
+            int local_n = tid - BM;
+            int gn = cta_n_base + local_n;
+            s_scale_w[local_n] = (gn < N) ? h2f(S_w[(size_t)gn * num_groups + g]) : 0.0f;
+        }
+
+        __syncthreads();
+
+        int acc_s32[2][4][4];
+        #pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            #pragma unroll
+            for (int ni = 0; ni < 4; ++ni) {
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    acc_s32[mi][ni][r] = 0;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int k_step = 0; k_step < 4; ++k_step) {
+            u32 reg_a[2][4];
+            u32 reg_b[4][2];
+
+            #pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                int a_row = (warp_m_idx << 5) + (mi << 4) + (lane_id & 15);
+                int a_col = (k_step << 3) + ((lane_id >> 2) & 4);
+                ptx_ldmatrix_x4(reg_a[mi], &s_A[a_row][a_col]);
+            }
+
+            #pragma unroll
+            for (int ni = 0; ni < 4; ++ni) {
+                int n_tile_local = (warp_n_idx << 2) + ni;
+                U2 raw_b = s_B[n_tile_local][k_step][lane_id];
+                reg_b[ni][0] = raw_b.x;
+                reg_b[ni][1] = raw_b.y;
+            }
+
+            #pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < 4; ++ni) {
+                    ptx_mma_m16n8k64_s4(acc_s32[mi][ni], reg_a[mi], reg_b[ni], acc_s32[mi][ni]);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            int m0_local = (warp_m_idx << 5) + (mi << 4) + group_id;
+            int m1_local = m0_local + 8;
+            float sx0 = s_scale_x[m0_local];
+            float sx1 = s_scale_x[m1_local];
+
+            #pragma unroll
+            for (int ni = 0; ni < 4; ++ni) {
+                int n0_local = (warp_n_idx << 5) + (ni << 3) + (tid_in_group << 1);
+                int n1_local = n0_local + 1;
+                float sw0 = s_scale_w[n0_local];
+                float sw1 = s_scale_w[n1_local];
+
+                acc_f32[mi][ni][0] += (float)acc_s32[mi][ni][0] * (sx0 * sw0);
+                acc_f32[mi][ni][1] += (float)acc_s32[mi][ni][1] * (sx0 * sw1);
+                acc_f32[mi][ni][2] += (float)acc_s32[mi][ni][2] * (sx1 * sw0);
+                acc_f32[mi][ni][3] += (float)acc_s32[mi][ni][3] * (sx1 * sw1);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+        int global_m0 = cta_m_base + (warp_m_idx << 5) + (mi << 4) + group_id;
+        int global_m1 = global_m0 + 8;
+
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            int global_n0 = cta_n_base + (warp_n_idx << 5) + (ni << 3) + (tid_in_group << 1);
+
+            if (global_m0 < M && (global_n0 + 1) < N) {
+                u16 p0 = f2bf(acc_f32[mi][ni][0]);
+                u16 p1 = f2bf(acc_f32[mi][ni][1]);
+                *reinterpret_cast<u32*>(&Y_out[(size_t)global_m0 * N + global_n0]) = ((u32)p1 << 16) | (u32)p0;
+            }
+            if (global_m1 < M && (global_n0 + 1) < N) {
+                u16 p0 = f2bf(acc_f32[mi][ni][2]);
+                u16 p1 = f2bf(acc_f32[mi][ni][3]);
+                *reinterpret_cast<u32*>(&Y_out[(size_t)global_m1 * N + global_n0]) = ((u32)p1 << 16) | (u32)p0;
+            }
+        }
+    }
+}
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -643,6 +908,7 @@ fn dev_ptr(st: &CudaStorage, l: &Layout) -> Result<u64> {
     Ok(match &st.slice {
         S::U8(s) => p!(s, u8),
         S::U32(s) => p!(s, u32),
+        S::I32(s) => p!(s, i32),
         S::I64(s) => p!(s, i64),
         S::BF16(s) => p!(s, half::bf16),
         S::F16(s) => p!(s, half::f16),
@@ -657,6 +923,8 @@ fn alloc_out(dev: &candle_core::CudaDevice, dt: DType, n: usize) -> Result<CudaS
         DType::F16 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<half::f16>(n)? }, dev.clone()),
         DType::BF16 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<half::bf16>(n)? }, dev.clone()),
         DType::U8 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<u8>(n)? }, dev.clone()),
+        DType::U32 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<u32>(n)? }, dev.clone()),
+        DType::I32 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<i32>(n)? }, dev.clone()),
         d => candle_core::bail!("alloc_out {d:?}"),
     })
 }
@@ -1526,4 +1794,84 @@ impl CustomOp1 for BilinearHw {
 /// Bilinear resize (PyTorch `align_corners=False`) of the last two dims of `x [T, C, H, W]`.
 pub fn bilinear_hw(x: &Tensor, ho: usize, wo: usize) -> Result<Tensor> {
     x.contiguous()?.apply_op1_no_bwd(&BilinearHw { ho, wo })
+}
+
+
+struct GemmW4A4Preswizzled {
+    out_features: usize,
+}
+impl CustomOp3 for GemmW4A4Preswizzled {
+    fn name(&self) -> &'static str {
+        "gemm_w4a4_preswizzled"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("gemm_w4a4_preswizzled: cuda only")
+    }
+    fn cuda_fwd(
+        &self,
+        x: &CudaStorage,
+        xl: &Layout,
+        w: &CudaStorage,
+        wl: &Layout,
+        ws: &CudaStorage,
+        wsl: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        need_contig(xl, "w4a4 x")?;
+        need_contig(wl, "w4a4 w")?;
+        need_contig(wsl, "w4a4 ws")?;
+        let (m, k) = xl.shape().dims2()?;
+        let n = self.out_features;
+        let dev = x.device().clone();
+
+        let ptx_code = ptx()?;
+        let f_quant = dev.get_or_load_custom_func("quant_act_w4a4_group256", MODULE, ptx_code)?;
+        let f_gemm = dev.get_or_load_custom_func("ampere_w4a4_group256_gemm_sm86", MODULE, ptx_code)?;
+
+        let a_packed = alloc_out(&dev, DType::U32, m * (k / 8))?;
+        let s_x = alloc_out(&dev, DType::F16, m * (k / 256))?;
+        let y_out = alloc_out(&dev, DType::BF16, m * n)?;
+
+        let xp = dev_ptr(x, xl)?;
+        let ap = out_ptr(&a_packed)?;
+        let sxp = out_ptr(&s_x)?;
+        let wp = dev_ptr(w, wl)?;
+        let swp = dev_ptr(ws, wsl)?;
+        let yp = out_ptr(&y_out)?;
+
+        let num_groups = (k / 256) as u32;
+        let total_groups = (m as u32) * num_groups;
+        let threads = 256u32;
+        let blocks = (total_groups * 32).div_ceil(threads);
+        let mut bld_quant = f_quant.builder();
+        let (mi, ki) = (m as i32, k as i32);
+        bld_quant.arg(&xp).arg(&ap).arg(&sxp).arg(&mi).arg(&ki);
+        let cfg_quant = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { bld_quant.launch(cfg_quant) }.w()?;
+
+        let grid_x = ((n + 63) / 64) as u32;
+        let grid_y = ((m + 63) / 64) as u32;
+        let ni = n as i32;
+        let mut bld_gemm = f_gemm.builder();
+        bld_gemm.arg(&ap).arg(&wp).arg(&sxp).arg(&swp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
+        let cfg_gemm = LaunchConfig { grid_dim: (grid_x, grid_y, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        unsafe { bld_gemm.launch(cfg_gemm) }.w()?;
+
+        Ok((y_out, Shape::from((m, n))))
+    }
+}
+
+pub fn gemm_w4a4_preswizzled(
+    x: &Tensor,
+    w: &Tensor,
+    ws: &Tensor,
+    bias: Option<&Tensor>,
+    out_features: usize,
+) -> Result<Tensor> {
+    let ws_f16 = ws.to_dtype(DType::F16)?;
+    let y = x.apply_op3_no_bwd(&w.contiguous()?, &ws_f16.contiguous()?, &GemmW4A4Preswizzled { out_features })?;
+    if let Some(b) = bias {
+        y.broadcast_add(&b.to_dtype(x.dtype())?)
+    } else {
+        Ok(y)
+    }
 }
