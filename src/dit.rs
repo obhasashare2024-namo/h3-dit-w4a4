@@ -906,6 +906,17 @@ impl Dit {
         };
         let q = kernels::qk_norm_rope(qkv, 0, h, d, qn, rope, rot, self.dtype)?;
         let k = kernels::qk_norm_rope(qkv, inner, h, d, kn, rope, rot, self.dtype)?;
+
+        let prefer_flash = std::env::var("H3_ATTN").map(|v| v != "int8" && v != "attn8").unwrap_or(true);
+        #[cfg(feature = "flash-attn")]
+        {
+            if prefer_flash && q.device().is_cuda() && matches!(q.dtype(), DType::F16 | DType::BF16) && d <= 256 {
+                let v = qkv.narrow(1, 2 * inner, inner)?.contiguous()?.reshape((s, h, d))?;
+                let o = ops::attention(&q.unsqueeze(0)?, &k.unsqueeze(0)?, &v.unsqueeze(0)?, false)?;
+                return Ok(o.reshape((s, inner))?);
+            }
+        }
+
         if crate::attn8::available(&q) {
             return Ok(crate::attn8::attention_qkv(&q, &k, qkv, 2 * inner)?.reshape((s, inner))?);
         }
