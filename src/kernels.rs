@@ -122,6 +122,26 @@ extern "C" __global__ void dequant_w4a8(const u8* q, const u8* s_rel, const floa
     }
 }
 
+// Dequantize SymW4A4 (sym_w4a4_convrot):
+// q: packed signed 4-bit nibbles [N, K/2] (lo nibble = even col, hi nibble = odd col)
+// scale: [N, K/256] in fp16 (u16)
+// out: [N, K] in target float dtype (0=f32, 1=f16, 2=bf16)
+extern "C" __global__ void dequant_sym_w4a4(const u8* q, const u16* scale, void* out,
+                                            unsigned long long N, unsigned long long K, int okind) {
+    unsigned long long n = N * K;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long r = i / K;
+        unsigned long long c = i % K;
+        u8 byte = q[r * (K / 2) + c / 2];
+        int nib = (c & 1) ? (byte >> 4) : (byte & 15);
+        int s4 = (nib >= 8) ? (nib - 16) : nib;
+        u16 s_h = scale[r * (K / 256) + c / 256];
+        float s = h2f(s_h);
+        stf(out, okind, i, (float)s4 * s);
+    }
+}
+
 // Per (token, head) row: optional RMSNorm (optional weight), then split-half RoPE over the first
 // rot dims. x is read at x + s*row_stride + col_off + h*D (elements); out is contiguous [S, H, D].
 // cs: [S, rot/2] cos then sin tables as f32 (cs = cos, cs + S*rot/2 = sin). D <= 256.
@@ -813,6 +833,46 @@ impl CustomOp3 for DequantW4A8 {
 
 pub fn dequant_w4a8(q: &Tensor, s_rel: &Tensor, s_channel: &Tensor, cb: &Tensor, k: usize, out: DType) -> Result<Tensor> {
     q.apply_op3_no_bwd(s_rel, s_channel, &DequantW4A8 { cb: cb.clone(), k, out })
+}
+
+struct DequantSymW4A4 {
+    k: usize,
+    out: DType,
+}
+impl CustomOp2 for DequantSymW4A4 {
+    fn name(&self) -> &'static str {
+        "dequant_sym_w4a4"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("dequant_sym_w4a4: cuda only")
+    }
+    fn cuda_fwd(
+        &self,
+        q: &CudaStorage,
+        ql: &Layout,
+        scale: &CudaStorage,
+        sl: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        need_contig(ql, "sym_w4a4 q")?;
+        need_contig(sl, "sym_w4a4 scale")?;
+        let rows = ql.shape().dims()[0];
+        let n = rows * self.k;
+        let dev = q.device().clone();
+        let func = dev.get_or_load_custom_func("dequant_sym_w4a4", MODULE, ptx()?)?;
+        let out = alloc_out(&dev, self.out, n)?;
+        let (qp, sp, op) = (dev_ptr(q, ql)?, dev_ptr(scale, sl)?, out_ptr(&out)?);
+        let (r, k, ok) = (rows as u64, self.k as u64, kind_of(self.out)?);
+        let mut b = func.builder();
+        b.arg(&qp).arg(&sp).arg(&op).arg(&r).arg(&k).arg(&ok);
+        unsafe { b.launch(grid_for(n)) }.w()?;
+        Ok((out, Shape::from((rows, self.k))))
+    }
+}
+
+pub fn dequant_sym_w4a4(q: &Tensor, scale: &Tensor, out: DType) -> Result<Tensor> {
+    let k = q.dim(1)? * 2;
+    let s_f16 = scale.to_dtype(DType::F16)?;
+    q.apply_op2_no_bwd(&s_f16, &DequantSymW4A4 { k, out })
 }
 
 pub fn dequant_nvfp4(q: &Tensor, block_scale: &Tensor, global: &Tensor, out: DType) -> Result<Tensor> {

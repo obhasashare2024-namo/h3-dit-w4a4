@@ -89,3 +89,7 @@ required-features = ["cuda"]
 [[example]]
 name = "parity_check"
 required-features = ["cuda"]
+
+[[example]]
+name = "test_w4a4"
+required-features = ["cuda"]

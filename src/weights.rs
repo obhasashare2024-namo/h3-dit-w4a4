@@ -546,6 +546,8 @@ pub enum QFormat {
     Nvfp4,
     /// Asymmetric W4A8 INT8 with Lloyd-Max codebook, group-16 FP8 relative scale, and Hadamard-256 ConvRot.
     AsymW4A8 { convrot: Option<usize>, group_size: usize, codebook: Held },
+    /// Symmetric W4A4 INT4 with Group-256 FP16 scale and Hadamard-256 ConvRot.
+    SymW4A4 { convrot: Option<usize>, group_size: usize },
 }
 
 /// A low-rank delta `scale * B @ A` added to a linear layer's output.
@@ -681,6 +683,17 @@ impl QLinear {
                 let codebook = Held::small(file, &format!("{prefix}.weight_codebook"), dev)?;
                 (QFormat::AsymW4A8 { convrot, group_size, codebook }, Some(s_channel), Some(s_rel), None, wshape[1] * 2)
             }
+            Some("sym_w4a4_convrot") => {
+                let c = conf.as_ref().unwrap();
+                let convrot = if c["convrot"].as_bool().unwrap_or(false) {
+                    Some(c["convrot_groupsize"].as_u64().unwrap_or(256) as usize)
+                } else {
+                    None
+                };
+                let group_size = c["group_size"].as_u64().unwrap_or(256) as usize;
+                let s = Held::small(file, &format!("{prefix}.weight_scale"), dev)?;
+                (QFormat::SymW4A4 { convrot, group_size }, Some(s), None, None, wshape[1] * 2)
+            }
             Some(f) => bail!("{prefix}: unsupported quantization format {f}"),
         };
         Ok(Self {
@@ -752,6 +765,10 @@ impl QLinear {
                 let s_channel = self.scale.as_ref().unwrap().get(dev)?;
                 kernels::dequant_w4a8(w, s_rel, &s_channel, &cb, self.in_features, dtype)?
             }
+            QFormat::SymW4A4 { .. } => {
+                let scale = self.scale.as_ref().unwrap().get(dev)?;
+                kernels::dequant_sym_w4a4(w, &scale, dtype)?
+            }
         })
     }
 
@@ -759,7 +776,7 @@ impl QLinear {
     pub fn dequant_plain(&self, dev: &Device, dtype: DType) -> Result<Tensor> {
         let w = self.dequant(dev, DType::F32)?;
         let w = match &self.fmt {
-            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
+            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
             _ => w,
         };
         Ok(w.to_dtype(dtype)?)
@@ -797,7 +814,7 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
                 _ => xc.clone(),
             };
             let mut y = xr.matmul(&wt)?;
@@ -877,7 +894,7 @@ impl QLinear {
             Ok(acc.unwrap())
         };
         match self.fmt {
-            QFormat::Nvfp4 | QFormat::AsymW4A8 { .. } => return Ok(()), // keep the runtime path for nvfp4 and w4a8
+            QFormat::Nvfp4 | QFormat::AsymW4A8 { .. } | QFormat::SymW4A4 { .. } => return Ok(()), // keep the runtime path for nvfp4 and w4a8
             QFormat::Dense => {
                 let w = self.weight.get(dev)?;
                 let dt = w.dtype();
@@ -1049,7 +1066,7 @@ impl QLinear {
                 let rows = x.elem_count() / k;
                 let x2 = x.reshape((rows, k))?;
                 let dev = x.device();
-                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
+                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
                 let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
                     QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fuse => rotate_activation(&x2, g),
                     _ => Ok(x2),
@@ -1073,9 +1090,9 @@ impl QLinear {
         let rows = x.elem_count() / k;
         let x2 = x.reshape((rows, k))?;
         // the warp-level rotation is fused into the quantizer (group 256, K <= 56 groups)
-        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) } | QFormat::AsymW4A8 { convrot: Some(256), .. }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
+        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) } | QFormat::AsymW4A8 { convrot: Some(256), .. } | QFormat::SymW4A4 { convrot: Some(256), .. }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
         let xr = match self.fmt {
-            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
+            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
             _ => x2,
         };
         let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -1104,7 +1121,7 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let dev = x.device();
-            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
+            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
             let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
                 QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fuse => rotate_activation(&xc, g),
                 _ => Ok(xc.clone()),
@@ -1145,7 +1162,7 @@ impl QLinear {
         for start in (0..rows).step_by(chunk.max(1)) {
             let xc = x2.narrow(0, start, chunk.max(1).min(rows-start))?;
             let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
                 _ => xc.clone(),
             };
             let mut y = w.forward(&xr)?;
