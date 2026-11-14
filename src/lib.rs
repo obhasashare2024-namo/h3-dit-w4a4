@@ -38,3 +38,5 @@ pub mod variants;
 pub mod vae_audio;
 pub mod vae_video;
 pub mod weights;
+#[cfg(feature = "cuda")]
+pub mod streaming;

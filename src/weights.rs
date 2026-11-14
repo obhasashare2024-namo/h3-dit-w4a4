@@ -15,8 +15,8 @@ use crate::kernels;
 pub struct TensorInfo {
     pub dtype: String,
     pub shape: Vec<usize>,
-    start: usize,
-    end: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 /// A memory-mapped `.safetensors` file. Raw bytes are only read when a tensor is materialized.
@@ -265,6 +265,16 @@ impl SafeFile {
         Ok(self.load(name, dev)?.to_dtype(dtype)?)
     }
 
+    #[inline]
+    pub fn data_start(&self) -> usize {
+        self.data_start
+    }
+
+    #[inline]
+    pub fn file_handle(&self) -> &std::fs::File {
+        &self.fh
+    }
+
     pub fn names_with_prefix(&self, prefix: &str) -> Vec<String> {
         let mut v: Vec<_> = self.tensors.keys().filter(|k| k.starts_with(prefix)).cloned().collect();
         v.sort();
@@ -473,6 +483,14 @@ impl Held {
     }
 
     /// Small tensors (norms, biases, scales) are always kept on the device.
+    pub fn new_offloaded_stub(file: &Arc<SafeFile>, name: &str) -> Result<Self> {
+        file.info(name)?;
+        Ok(Held::File {
+            file: file.clone(),
+            name: name.to_string(),
+        })
+    }
+
     pub fn small(file: &Arc<SafeFile>, name: &str, dev: &Device) -> Result<Self> {
         Ok(Held::Dev(file.load(name, dev)?))
     }
@@ -722,10 +740,15 @@ impl QLinear {
         };
         let is_preswizzled = matches!(fmt, QFormat::AmpereW4A4Preswizzled { .. });
         let out_features = if is_preswizzled { wshape[0] * 8 } else { wshape[0] };
+        let weight = if matches!(place, Placement::Ram | Placement::Disk) && is_preswizzled {
+            Held::new_offloaded_stub(file, &wname)?
+        } else {
+            Held::new(file, &wname, place, dev)?
+        };
         Ok(Self {
             name: prefix.to_string(),
             fmt,
-            weight: Held::new(file, &wname, place, dev)?,
+            weight,
             scale,
             block_scale,
             pre_quant_scale: pqs,

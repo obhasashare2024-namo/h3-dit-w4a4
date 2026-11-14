@@ -442,6 +442,8 @@ pub struct Dit {
     /// Debug: block indices whose outputs are recorded into `captured`.
     pub capture_blocks: Vec<usize>,
     pub captured: std::cell::RefCell<Vec<(usize, Tensor)>>,
+    #[cfg(feature = "cuda")]
+    pub streaming: Option<crate::streaming::StreamingEngine>,
 }
 
 /// Conditioning for one sampling run.
@@ -582,6 +584,26 @@ impl Dit {
             1_000_000_000,
         );
         let resident = tiers.vram;
+        #[cfg(feature = "cuda")]
+        crate::kernels::keep_pool_memory(dev);
+        #[cfg(feature = "cuda")]
+        let streaming = if dev.is_cuda() && tiers.vram < cfg.layers {
+            let max_slot_bytes = (block_bytes + 4096).next_multiple_of(4096);
+            log::info(&format!(
+                "StreamingEngine: initializing 3-tier streaming ({} VRAM, {} RAM, {} Disk, slot {} MB)",
+                tiers.vram, tiers.ram, tiers.disk, max_slot_bytes / 1024 / 1024
+            ));
+            Some(crate::streaming::StreamingEngine::new(
+                &f,
+                dev,
+                cfg.layers,
+                tiers.vram,
+                tiers.ram,
+                max_slot_bytes,
+            )?)
+        } else {
+            None
+        };
         log::info(&format!(
             "DiT 3-Tier Allocation: {} VRAM ({:.2} GB) | {} RAM ({:.2} GB) | {} Disk ({:.2} GB) [Total {} blocks]",
             tiers.vram, (tiers.vram * block_bytes) as f64 / 1e9,
@@ -595,14 +617,18 @@ impl Dit {
                 let (free, _) = crate::config::vram_info().unwrap_or((0, 0));
                 log::info(&format!("loading block {i}, free VRAM {:.2} GB", free as f64 / 1e9));
             }
-            let place = if i < tiers.vram {
+            let p = format!("blocks.{i}");
+            let is_fused = f.has(&format!("{p}.attn.qkv_proj.weight"))
+                && f.has(&format!("{p}.attn.out_proj.weight"))
+                && f.has(&format!("{p}.mlp.fc1.weight"))
+                && f.has(&format!("{p}.mlp.fc2.weight"));
+            let place = if i < tiers.vram || !is_fused {
                 Placement::Gpu
             } else if i < tiers.vram + tiers.ram {
                 Placement::Ram
             } else {
                 Placement::Disk
             };
-            let p = format!("blocks.{i}");
             let ad = if cfg.curve_grid.is_some() { dense_f32(&f, &format!("{p}.adaln_proj.linear"), dev)? } else {
                 QLinear::load(&f, &format!("{p}.adaln_proj.linear"), place, dev, dtype)?
             };
@@ -704,6 +730,8 @@ impl Dit {
             control: None,
             capture_blocks: vec![],
             captured: Default::default(),
+            #[cfg(feature = "cuda")]
+            streaming,
             cfg,
         };
         if let Some((l, strength)) = lora {
@@ -1299,38 +1327,99 @@ impl Dit {
         let curve = self.adaln_t_table.is_some();
         let hidden = self.cfg.hidden;
         let cx = StepCtx { t_emb: &t_emb, curve, idx: &idx, rope: &run.rope, u: unique.len() };
-        let fetch = |b: &Block| -> Result<Option<[crate::weights::Raw; 4]>> {
-            match (&b.qkv, &b.out, &b.fc1, &b.fc2) {
-                (QkvProj::Fused(qkv), LinProj::Single(out), LinProj::Single(fc1), LinProj::Single(fc2)) => {
-                    Ok(Some([qkv.fetch(dev)?, out.fetch(dev)?, fc1.fetch(dev)?, fc2.fetch(dev)?]))
+        #[cfg(feature = "cuda")]
+        if let Some(engine) = &self.streaming {
+            let step_id = engine.begin_step_and_prime()?;
+            let resident = self.resident;
+            // 1. Run VRAM resident blocks [0..resident)
+            for bi in 0..resident {
+                crate::progress::check()?;
+                let b = &self.blocks[bi];
+                let raws = match (&b.qkv, &b.out, &b.fc1, &b.fc2) {
+                    (QkvProj::Fused(qkv), LinProj::Single(out), LinProj::Single(fc1), LinProj::Single(fc2)) => {
+                        Some([qkv.fetch(dev)?, out.fetch(dev)?, fc1.fetch(dev)?, fc2.fetch(dev)?])
+                    }
+                    _ => None,
+                };
+                x = self.run_block(b, raws, x, &cx)?;
+                if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
+                    if ci == 0 {
+                        cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);
+                    }
+                    let (c, skip) = model.step(self, ci, cstream.take().unwrap(), &cx)?;
+                    cstream = Some(c);
+                    x = (x + skip.to_dtype(self.dtype)?.broadcast_mul(&rc.scale.to_dtype(self.dtype)?)?)?;
                 }
-                _ => Ok(None),
-            }
-        };
-        let mut next = fetch(&self.blocks[0])?;
-        let mut prev_marker: Option<crate::weights::Marker> = None;
-        for (bi, b) in self.blocks.iter().enumerate() {
-            crate::progress::check()?;
-            let raws = next.take();
-            x = self.run_block(b, raws, x, &cx)?;
-            if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
-                if ci == 0 {
-                    cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);
+                if self.capture_blocks.contains(&bi) {
+                    self.captured.borrow_mut().push((bi, x.clone()));
                 }
-                let (c, skip) = model.step(self, ci, cstream.take().unwrap(), &cx)?;
-                cstream = Some(c);
-                x = (x + skip.to_dtype(self.dtype)?.broadcast_mul(&rc.scale.to_dtype(self.dtype)?)?)?;
             }
-            // block bi is enqueued: once the GPU is past block bi-1, start uploading block bi+1
-            if let Some(m) = prev_marker.take() {
-                m.wait();
+
+            // 2. Run offloaded blocks [resident..47) with Zero-Allocation Double-Buffered StagingRing
+            for bi in resident..self.blocks.len() {
+                crate::progress::check()?;
+                let b = &self.blocks[bi];
+
+                let raws = if let Some(off_idx) = engine.offload_index_of(bi) {
+                    let r = engine.acquire_compute_slot(off_idx)?;
+                    Some((off_idx, r))
+                } else {
+                    None
+                };
+
+                let raw_weights = raws.as_ref().map(|(_, r)| r.clone());
+                x = self.run_block(b, raw_weights, x, &cx)?;
+
+                if let Some((off_idx, _)) = raws {
+                    engine.release_compute_slot_and_prefetch(off_idx, step_id)?;
+                }
+
+                if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
+                    if ci == 0 {
+                        cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);
+                    }
+                    let (c, skip) = model.step(self, ci, cstream.take().unwrap(), &cx)?;
+                    cstream = Some(c);
+                    x = (x + skip.to_dtype(self.dtype)?.broadcast_mul(&rc.scale.to_dtype(self.dtype)?)?)?;
+                }
+                if self.capture_blocks.contains(&bi) {
+                    self.captured.borrow_mut().push((bi, x.clone()));
+                }
             }
-            prev_marker = Some(crate::weights::Marker::record(dev));
-            if bi + 1 < self.blocks.len() {
-                next = fetch(&self.blocks[bi + 1])?;
-            }
-            if self.capture_blocks.contains(&bi) {
-                self.captured.borrow_mut().push((bi, x.clone()));
+        } else {
+            let fetch = |b: &Block| -> Result<Option<[crate::weights::Raw; 4]>> {
+                match (&b.qkv, &b.out, &b.fc1, &b.fc2) {
+                    (QkvProj::Fused(qkv), LinProj::Single(out), LinProj::Single(fc1), LinProj::Single(fc2)) => {
+                        Ok(Some([qkv.fetch(dev)?, out.fetch(dev)?, fc1.fetch(dev)?, fc2.fetch(dev)?]))
+                    }
+                    _ => Ok(None),
+                }
+            };
+            let mut next = fetch(&self.blocks[0])?;
+            let mut prev_marker: Option<crate::weights::Marker> = None;
+            for (bi, b) in self.blocks.iter().enumerate() {
+                crate::progress::check()?;
+                let raws = next.take();
+                x = self.run_block(b, raws, x, &cx)?;
+                if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
+                    if ci == 0 {
+                        cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);
+                    }
+                    let (c, skip) = model.step(self, ci, cstream.take().unwrap(), &cx)?;
+                    cstream = Some(c);
+                    x = (x + skip.to_dtype(self.dtype)?.broadcast_mul(&rc.scale.to_dtype(self.dtype)?)?)?;
+                }
+                // block bi is enqueued: once the GPU is past block bi-1, start uploading block bi+1
+                if let Some(m) = prev_marker.take() {
+                    m.wait();
+                }
+                prev_marker = Some(crate::weights::Marker::record(dev));
+                if bi + 1 < self.blocks.len() {
+                    next = fetch(&self.blocks[bi + 1])?;
+                }
+                if self.capture_blocks.contains(&bi) {
+                    self.captured.borrow_mut().push((bi, x.clone()));
+                }
             }
         }
 
