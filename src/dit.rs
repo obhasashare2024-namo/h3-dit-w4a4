@@ -934,17 +934,101 @@ impl Dit {
             return if g >= 1 && self.cfg.heads % g == 0 { g } else { 1 };
         }
         let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
-        let ok = lin.loras.is_empty() && !lin.interleaved && lin.block_scale.is_none() && crate::attn8::available_arch(&self.dev) && self.cfg.head_dim == 128;
-        if !ok || qkv_bytes <= ATTN_QKV_BUDGET {
+        let is_w4a4 = matches!(lin.fmt, crate::weights::QFormat::AmpereW4A4Preswizzled { .. });
+        let is_attn8 = crate::attn8::available_arch(&self.dev);
+        let ok = (is_w4a4 || is_attn8) && lin.loras.is_empty() && !lin.interleaved && lin.block_scale.is_none() && self.cfg.head_dim == 128;
+        let budget: usize = std::env::var("H3_ATTN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400_000_000);
+        if !ok || qkv_bytes <= budget {
             return 1;
         }
-        let want = qkv_bytes.div_ceil(ATTN_QKV_BUDGET);
-        (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads)
+        let want = qkv_bytes.div_ceil(budget);
+        let res = (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads);
+        println!("[attn_groups] is_w4a4={}, is_attn8={}, ok={}, qkv_bytes={}, budget={}, res={}", is_w4a4, is_attn8, ok, qkv_bytes, budget, res);
+        res
     }
 
     /// Attention of one block, `groups` heads groups at a time (see [`attn_groups`](Self::attn_groups)); consumes
     /// `n1`, the modulated input of the qkv projection.
     #[allow(clippy::too_many_arguments)]
+    fn attend_factorized(
+        &self,
+        q: &LowRankLinear,
+        k: &LowRankLinear,
+        v: &LowRankLinear,
+        b: &Block,
+        n1: Tensor,
+        rope: &Tensor,
+        rot: usize,
+        groups: usize,
+    ) -> Result<Tensor> {
+        let (h, d) = (self.cfg.heads, self.cfg.head_dim);
+        let (hg, w) = (h / groups, h / groups * d);
+        let s = n1.dim(0)?;
+
+        let mid_q = prof::time("q down", &self.dev, || q.down.forward(&n1))?;
+        let mid_k = prof::time("k down", &self.dev, || k.down.forward(&n1))?;
+        let mid_v = prof::time("v down", &self.dev, || v.down.forward(&n1))?;
+        drop(n1);
+
+        let mut outs = Vec::with_capacity(groups);
+        for g in 0..groups {
+            let r0 = g * w;
+            let q_up = q.up.rows(r0, w, &self.dev)?;
+            let qt = prof::time("q up", &self.dev, || q_up.forward(&mid_q))?;
+            let q_norm = kernels::qk_norm_rope(&qt, 0, hg, d, Some((Some(&b.q_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
+            drop(qt);
+
+            let k_up = k.up.rows(r0, w, &self.dev)?;
+            let kt = prof::time("k up", &self.dev, || k_up.forward(&mid_k))?;
+            let k_norm = kernels::qk_norm_rope(&kt, 0, hg, d, Some((Some(&b.k_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
+            drop(kt);
+
+            let v_up = v.up.rows(r0, w, &self.dev)?;
+            let vt = prof::time("v up", &self.dev, || v_up.forward(&mid_v))?;
+
+            let o = prof::time("attention", &self.dev, || -> Result<Tensor> {
+                let prefer_flash = std::env::var("H3_ATTN").map(|v| v != "int8" && v != "attn8").unwrap_or(true);
+                #[cfg(feature = "flash-attn")]
+                {
+                    if prefer_flash && q_norm.device().is_cuda() && matches!(q_norm.dtype(), DType::F16 | DType::BF16) && d <= 256 {
+                        let v_res = vt.contiguous()?.reshape((s, hg, d))?;
+                        let o = ops::attention(&q_norm.unsqueeze(0)?, &k_norm.unsqueeze(0)?, &v_res.unsqueeze(0)?, false)?;
+                        return Ok(o.reshape((s, w))?);
+                    }
+                }
+                if crate::attn8::available(&q_norm) {
+                    return Ok(crate::attn8::attention_qkv(&q_norm, &k_norm, &vt, 0)?.reshape((s, w))?);
+                }
+                let v_res = vt.contiguous()?.reshape((s, hg, d))?;
+                let o = ops::attention(&q_norm.unsqueeze(0)?, &k_norm.unsqueeze(0)?, &v_res.unsqueeze(0)?, false)?;
+                Ok(o.reshape((s, w))?)
+            })?;
+            if s > 30000 && groups > 1 {
+                outs.push(o.to_device(&Device::Cpu)?);
+            } else {
+                outs.push(o);
+            }
+        }
+        drop((mid_q, mid_k, mid_v));
+        if outs.len() == 1 {
+            let o = outs.pop().unwrap();
+            if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
+        } else if s > 30000 {
+            let o_cpu = Tensor::cat(&outs, 1)?;
+            drop(outs);
+            Ok(o_cpu)
+        } else {
+            let mut outs_dev = Vec::with_capacity(outs.len());
+            for t in outs {
+                outs_dev.push(if t.device().is_cuda() { t } else { t.to_device(&self.dev)? });
+            }
+            Ok(Tensor::cat(&outs_dev, 1)?)
+        }
+    }
+
     fn attend_grouped_qkv(&self, qkv: &QLinear, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<Tensor> {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let inner = h * d;
@@ -954,20 +1038,63 @@ impl Dit {
             let r0 = base + g * w;
             qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
         };
+        println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, free VRAM={:.2} GB", s, groups, w, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
         let mut outs = Vec::with_capacity(groups);
         for g in 0..groups {
+            println!("[attend_grouped_qkv] g={}: projecting q, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let qt = prof::time("qkv linear", &self.dev, || proj(0, g))?;
+            println!("[attend_grouped_qkv] g={}: q projected, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let q = kernels::qk_norm_rope(&qt, 0, hg, d, Some((Some(&b.q_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
             drop(qt);
+            println!("[attend_grouped_qkv] g={}: q_norm done, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let kt = prof::time("qkv linear", &self.dev, || proj(inner, g))?;
+            println!("[attend_grouped_qkv] g={}: kt projected, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let k = kernels::qk_norm_rope(&kt, 0, hg, d, Some((Some(&b.k_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
             drop(kt);
+            println!("[attend_grouped_qkv] g={}: k_norm done, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let vt = prof::time("qkv linear", &self.dev, || proj(2 * inner, g))?;
-            let o = prof::time("attention", &self.dev, || crate::attn8::attention_qkv(&q, &k, &vt, 0))?;
-            outs.push(o.reshape((s, w))?);
+            println!("[attend_grouped_qkv] g={}: vt projected, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+            let o = prof::time("attention", &self.dev, || -> Result<Tensor> {
+                let prefer_flash = std::env::var("H3_ATTN").map(|v| v != "int8" && v != "attn8").unwrap_or(true);
+                #[cfg(feature = "flash-attn")]
+                {
+                    if prefer_flash && q.device().is_cuda() && matches!(q.dtype(), DType::F16 | DType::BF16) && d <= 256 {
+                        let v = vt.contiguous()?.reshape((s, hg, d))?;
+                        let o = ops::attention(&q.unsqueeze(0)?, &k.unsqueeze(0)?, &v.unsqueeze(0)?, false)?;
+                        return Ok(o.reshape((s, w))?);
+                    }
+                }
+                if crate::attn8::available(&q) {
+                    return Ok(crate::attn8::attention_qkv(&q, &k, &vt, 0)?.reshape((s, w))?);
+                }
+                let v = vt.contiguous()?.reshape((s, hg, d))?;
+                let o = ops::attention(&q.unsqueeze(0)?, &k.unsqueeze(0)?, &v.unsqueeze(0)?, false)?;
+                Ok(o.reshape((s, w))?)
+            })?;
+            drop((q, k, vt));
+            if s > 30000 && groups > 1 {
+                outs.push(o.to_device(&Device::Cpu)?);
+            } else {
+                outs.push(o);
+            }
         }
+        println!("[attend_grouped_qkv] loop finished, dropping n1...");
         drop(n1);
-        Ok(if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 1)? })
+        println!("[attend_grouped_qkv] catting outs (len={})...", outs.len());
+        if outs.len() == 1 {
+            let o = outs.pop().unwrap();
+            if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
+        } else if s > 30000 {
+            let o_cpu = Tensor::cat(&outs, 1)?;
+            drop(outs);
+            Ok(o_cpu)
+        } else {
+            let mut outs_dev = Vec::with_capacity(outs.len());
+            for t in outs {
+                outs_dev.push(if t.device().is_cuda() { t } else { t.to_device(&self.dev)? });
+            }
+            Ok(Tensor::cat(&outs_dev, 1)?)
+        }
     }
 
     fn rope_angles(&self, layout: &PackedLayout) -> Result<Tensor> {
@@ -1148,32 +1275,218 @@ impl Dit {
         let (shift_msa, scale_msa, gate_msa) = (c(0)?, c(1)?, c(2)?);
         let (shift_mlp, scale_mlp, gate_mlp) = (c(3)?, c(4)?, c(5)?);
 
-        let n1 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?;
-        let qkv = prof::time("qkv linear", dev, || match (&b.qkv, &raws) {
-            (QkvProj::Fused(qkv), Some([r_qkv, ..])) => {
-                let groups = self.attn_groups(n1.dim(0)?, qkv);
-                if groups > 1 {
-                    self.attend_grouped_qkv(qkv, b, n1.clone(), r_qkv, cx.rope, rot, groups, chunk)
+        let (free_vram_rb, _) = crate::config::vram_info().unwrap_or((0, 0));
+        let groups = match &b.qkv {
+            QkvProj::Fused(qkv) => self.attn_groups(x.dim(0)?, qkv),
+            QkvProj::Factorized { .. } => {
+                let tokens = x.dim(0)?;
+                let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
+                let budget: usize = std::env::var("H3_ATTN_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(800_000_000);
+                if qkv_bytes <= budget {
+                    1
                 } else {
-                    qkv.forward_raw(&n1, r_qkv, chunk)
+                    let want = qkv_bytes.div_ceil(budget);
+                    (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads)
                 }
             }
-            _ => b.qkv.forward(&n1),
-        })?;
-        drop(n1);
-        let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(cx.rope), rot, h, d))?;
-        drop(qkv);
+        };
+        let mut x_holder = Some(x);
+        let n1 = {
+            let x_ref = x_holder.as_ref().unwrap();
+            prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?
+        };
+        let (x_saved, dev_ref) = if x_holder.as_ref().unwrap().dim(0)? > 30000 {
+            (Some(x_holder.take().unwrap().to_device(&Device::Cpu)?), dev)
+        } else {
+            (None, dev)
+        };
+        let att = match &b.qkv {
+            QkvProj::Fused(qkv) if groups > 1 => {
+                let r_qkv = match &raws {
+                    Some([r, ..]) => r.clone(),
+                    None => qkv.fetch(dev)?,
+                };
+                self.attend_grouped_qkv(qkv, b, n1, &r_qkv, cx.rope, rot, groups, chunk)?
+            }
+            QkvProj::Fused(qkv) => {
+                let qkv_t = prof::time("qkv linear", dev, || match &raws {
+                    Some([r_qkv, ..]) => qkv.forward_raw(&n1, r_qkv, chunk),
+                    _ => qkv.forward(&n1),
+                })?;
+                drop(n1);
+                let att = prof::time("attention", dev, || self.attend(&qkv_t, Some((&b.q_norm, &b.k_norm)), Some(cx.rope), rot, h, d))?;
+                drop(qkv_t);
+                att
+            }
+            QkvProj::Factorized { q, k, v } => {
+                self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups)?
+            }
+        };
 
-        let o = prof::time("out linear", dev, || match (&b.out, &raws) {
-            (LinProj::Single(out), Some([_, r_out, ..])) => out.forward_raw(&att, r_out, chunk),
-            _ => b.out.forward(&att),
-        })?;
-        drop(att);
-        x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, cx.idx))?;
-        drop(o);
+        let s = att.dim(0)?;
+        let mut x = if let Some(x_cpu) = x_saved {
+            x_cpu.to_device(dev_ref)?
+        } else {
+            x_holder.unwrap()
+        };
+
+        if s > 30000 {
+            let (free_vram_out, _) = crate::config::vram_info().unwrap_or((0, 0));
+            println!("[out linear] start in-place: s={}, att device={:?}, free VRAM={:.2} GB", s, att.device(), free_vram_out as f64 / 1e9);
+            prof::time("out linear in-place", dev, || -> Result<()> {
+                match (&b.out, &raws) {
+                    (LinProj::Single(out), Some([_, r_out, ..])) => {
+                        let mut st = 0;
+                        while st < s {
+                            let n = chunk.min(s - st);
+                            let chunk_x = x.narrow(0, st, n)?;
+                            let chunk_idx = cx.idx.narrow(0, st, n)?;
+                            let chunk_att_raw = att.narrow(0, st, n)?;
+                            let chunk_att = if chunk_att_raw.device().is_cuda() { chunk_att_raw } else { chunk_att_raw.to_device(dev)? };
+                            let yc = out.forward_raw(&chunk_att, r_out, chunk)?;
+                            drop(chunk_att);
+                            kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                            drop(yc);
+                            st += n;
+                        }
+                    }
+                    (LinProj::Single(out), None) => {
+                        let r_out = out.fetch(dev)?;
+                        let mut st = 0;
+                        while st < s {
+                            let n = chunk.min(s - st);
+                            let chunk_x = x.narrow(0, st, n)?;
+                            let chunk_idx = cx.idx.narrow(0, st, n)?;
+                            let chunk_att_raw = att.narrow(0, st, n)?;
+                            let chunk_att = if chunk_att_raw.device().is_cuda() { chunk_att_raw } else { chunk_att_raw.to_device(dev)? };
+                            let yc = out.forward_raw(&chunk_att, &r_out, chunk)?;
+                            drop(chunk_att);
+                            kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                            drop(yc);
+                            st += n;
+                        }
+                    }
+                    (LinProj::Factorized(lr), _) => {
+                        let mut st = 0;
+                        while st < s {
+                            let n = chunk.min(s - st);
+                            let chunk_x = x.narrow(0, st, n)?;
+                            let chunk_idx = cx.idx.narrow(0, st, n)?;
+                            let chunk_att_raw = att.narrow(0, st, n)?;
+                            let chunk_att = if chunk_att_raw.device().is_cuda() { chunk_att_raw } else { chunk_att_raw.to_device(dev)? };
+                            let mid = lr.down.forward(&chunk_att)?;
+                            drop(chunk_att);
+                            let yc = lr.up.forward(&mid)?;
+                            drop(mid);
+                            kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                            drop(yc);
+                            st += n;
+                        }
+                    }
+                    _ => {
+                        let yc = b.out.forward(&att)?;
+                        kernels::gate_add_inplace(&x, &yc, &gate_msa, cx.idx)?;
+                    }
+                }
+                Ok(())
+            })?;
+            drop(att);
+        } else {
+            let o = prof::time("out linear", dev, || match (&b.out, &raws) {
+                (LinProj::Single(out), Some([_, r_out, ..])) => out.forward_raw(&att, r_out, chunk),
+                (LinProj::Single(out), None) => {
+                    let r_out = out.fetch(dev)?;
+                    out.forward_raw(&att, &r_out, chunk)
+                }
+                (LinProj::Factorized(lr), _) => {
+                    let mid = lr.down.forward(&att)?;
+                    lr.up.forward(&mid)
+                }
+                _ => b.out.forward(&att),
+            })?;
+            drop(att);
+            let o = if o.device().is_cuda() { o } else { o.to_device(dev)? };
+            x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, cx.idx))?;
+            drop(o);
+        }
+
+        let s = x.dim(0)?;
+        if s > 30000 {
+            let (free_vram_mlp, _) = crate::config::vram_info().unwrap_or((0, 0));
+            println!("[dit] run_block: mlp start (IN-PLACE GPU RESIDUAL), free VRAM={:.2} GB", free_vram_mlp as f64 / 1e9);
+            prof::time("mlp_inplace", dev, || -> Result<()> {
+                let mc = self.mem.mlp_chunk.max(1);
+                match (&b.fc1, &b.fc2, &raws) {
+                    (LinProj::Single(fc1), LinProj::Single(fc2), Some([_, _, r_fc1, r_fc2])) => {
+                        let w1 = prof::time("dequant", dev, || fc1.prepare(r_fc1.clone(), dev, self.dtype))?;
+                        let w2 = prof::time("dequant", dev, || fc2.prepare(r_fc2.clone(), dev, self.dtype))?;
+                        let mut st = 0;
+                        while st < s {
+                            let n = mc.min(s - st);
+                            let chunk_x = x.narrow(0, st, n)?;
+                            let chunk_idx = cx.idx.narrow(0, st, n)?;
+                            let chunk_n2 = kernels::rms_modulate(&chunk_x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, &chunk_idx)?;
+                            let hc = fc1.run_swiglu(&chunk_n2, &w1, usize::MAX)?;
+                            drop(chunk_n2);
+                            let out_chunk = fc2.run(&hc, &w2, usize::MAX)?;
+                            drop(hc);
+                            kernels::gate_add_inplace(&chunk_x, &out_chunk, &gate_mlp, &chunk_idx)?;
+                            drop(out_chunk);
+                            st += n;
+                        }
+                    }
+                    (LinProj::Single(fc1), LinProj::Single(fc2), None) => {
+                        let r_fc1 = fc1.fetch(dev)?;
+                        let r_fc2 = fc2.fetch(dev)?;
+                        let w1 = prof::time("dequant", dev, || fc1.prepare(r_fc1, dev, self.dtype))?;
+                        let w2 = prof::time("dequant", dev, || fc2.prepare(r_fc2, dev, self.dtype))?;
+                        let mut st = 0;
+                        while st < s {
+                            let n = mc.min(s - st);
+                            let chunk_x = x.narrow(0, st, n)?;
+                            let chunk_idx = cx.idx.narrow(0, st, n)?;
+                            let chunk_n2 = kernels::rms_modulate(&chunk_x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, &chunk_idx)?;
+                            let hc = fc1.run_swiglu(&chunk_n2, &w1, usize::MAX)?;
+                            drop(chunk_n2);
+                            let out_chunk = fc2.run(&hc, &w2, usize::MAX)?;
+                            drop(hc);
+                            kernels::gate_add_inplace(&chunk_x, &out_chunk, &gate_mlp, &chunk_idx)?;
+                            drop(out_chunk);
+                            st += n;
+                        }
+                    }
+                    _ => {
+                        let mut st = 0;
+                        while st < s {
+                            let n = mc.min(s - st);
+                            let chunk_x = x.narrow(0, st, n)?;
+                            let chunk_idx = cx.idx.narrow(0, st, n)?;
+                            let chunk_n2 = kernels::rms_modulate(&chunk_x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, &chunk_idx)?;
+                            let h1 = b.fc1.forward(&chunk_n2)?;
+                            drop(chunk_n2);
+                            let hc = ops::swiglu(&h1)?;
+                            drop(h1);
+                            let out_chunk = b.fc2.forward(&hc)?;
+                            drop(hc);
+                            kernels::gate_add_inplace(&chunk_x, &out_chunk, &gate_mlp, &chunk_idx)?;
+                            drop(out_chunk);
+                            st += n;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(x);
+        }
 
         let n2 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, cx.idx)?) })?;
-        let s = n2.dim(0)?;
+        let (x_saved_mlp, mut x_holder_mlp) = (None::<Tensor>, Some(x));
+
+        let (free_vram_mlp, _) = crate::config::vram_info().unwrap_or((0, 0));
+        println!("[dit] run_block: mlp start, free VRAM={:.2} GB", free_vram_mlp as f64 / 1e9);
         let mo = prof::time("mlp", dev, || -> Result<Tensor> {
             match (&b.fc1, &b.fc2, &raws) {
                 (LinProj::Single(fc1), LinProj::Single(fc2), Some([_, _, r_fc1, r_fc2])) => {
@@ -1185,20 +1498,87 @@ impl Dit {
                     while st < s {
                         let n = mc.min(s - st);
                         let hc = fc1.run_swiglu(&n2.narrow(0, st, n)?, &w1, usize::MAX)?;
-                        outs.push(fc2.run(&hc, &w2, usize::MAX)?);
+                        let out_chunk = fc2.run(&hc, &w2, usize::MAX)?;
+                        drop(hc);
+                        if s > 30000 {
+                            outs.push(out_chunk.to_device(&Device::Cpu)?);
+                        } else {
+                            outs.push(out_chunk);
+                        }
                         st += n;
                     }
                     drop((w1, w2));
-                    if outs.len() == 1 { Ok(outs.pop().unwrap()) } else { Ok(Tensor::cat(&outs, 0)?) }
+                    if outs.len() == 1 {
+                        Ok(outs.pop().unwrap())
+                    } else {
+                        Ok(Tensor::cat(&outs, 0)?)
+                    }
+                }
+                (LinProj::Single(fc1), LinProj::Single(fc2), None) => {
+                    let r_fc1 = fc1.fetch(dev)?;
+                    let r_fc2 = fc2.fetch(dev)?;
+                    let w1 = prof::time("dequant", dev, || fc1.prepare(r_fc1, dev, self.dtype))?;
+                    let w2 = prof::time("dequant", dev, || fc2.prepare(r_fc2, dev, self.dtype))?;
+                    let mut outs = vec![];
+                    let mc = self.mem.mlp_chunk.max(1);
+                    let mut st = 0;
+                    while st < s {
+                        let n = mc.min(s - st);
+                        let hc = fc1.run_swiglu(&n2.narrow(0, st, n)?, &w1, usize::MAX)?;
+                        let out_chunk = fc2.run(&hc, &w2, usize::MAX)?;
+                        drop(hc);
+                        if s > 30000 {
+                            outs.push(out_chunk.to_device(&Device::Cpu)?);
+                        } else {
+                            outs.push(out_chunk);
+                        }
+                        st += n;
+                    }
+                    drop((w1, w2));
+                    if outs.len() == 1 {
+                        Ok(outs.pop().unwrap())
+                    } else {
+                        Ok(Tensor::cat(&outs, 0)?)
+                    }
                 }
                 _ => {
-                    let h1 = b.fc1.forward(&n2)?;
-                    let hc = ops::swiglu(&h1)?;
-                    b.fc2.forward(&hc)
+                    let mut outs = vec![];
+                    let mc = self.mem.mlp_chunk.max(1);
+                    let mut st = 0;
+                    while st < s {
+                        let n = mc.min(s - st);
+                        let n2_chunk = n2.narrow(0, st, n)?;
+                        let h1 = b.fc1.forward(&n2_chunk)?;
+                        drop(n2_chunk);
+                        let hc = ops::swiglu(&h1)?;
+                        drop(h1);
+                        let out_chunk = b.fc2.forward(&hc)?;
+                        drop(hc);
+                        if s > 30000 {
+                            outs.push(out_chunk.to_device(&Device::Cpu)?);
+                        } else {
+                            outs.push(out_chunk);
+                        }
+                        st += n;
+                    }
+                    if outs.len() == 1 {
+                        Ok(outs.pop().unwrap())
+                    } else {
+                        Ok(Tensor::cat(&outs, 0)?)
+                    }
                 }
             }
         })?;
-        x = kernels::gate_add(&x, &mo, &gate_mlp, cx.idx)?;
+        drop(n2);
+
+        let mo = if mo.device().is_cuda() { mo } else { mo.to_device(dev)? };
+        let x = if let Some(x_cpu) = x_saved_mlp {
+            x_cpu.to_device(dev)?
+        } else {
+            x_holder_mlp.take().unwrap()
+        };
+        let x = kernels::gate_add(&x, &mo, &gate_mlp, cx.idx)?;
+        drop(mo);
 
         Ok(x)
     }
@@ -1308,14 +1688,55 @@ impl Dit {
             Some(c) => Tensor::cat(&[c, &audio_rows], 0)?,
             None => audio_rows,
         };
-        let ve = self.video_patch_proj.forward(&all_v)?.to_dtype(self.dtype)?;
-        let ae = self.audio_patch_proj.forward(&all_a)?.to_dtype(self.dtype)?;
+        let (free_vram, _) = crate::config::vram_info().unwrap_or((0, 0));
+        println!("[dit] forward_inner: seq_len={}, free VRAM={:.2} GB, running patch proj...", layout.seq_len, free_vram as f64 / 1e9);
+        let on_cpu = layout.seq_len > 30000;
+        let chunked_proj = |proj: &QLinear, t: &Tensor| -> Result<Tensor> {
+            let rows = t.dim(0)?;
+            let chunk_size = 4096;
+            let mut outs = vec![];
+            let mut st = 0;
+            while st < rows {
+                let n = chunk_size.min(rows - st);
+                let chunk = t.narrow(0, st, n)?;
+                let p = proj.forward(&chunk)?.to_dtype(self.dtype)?;
+                drop(chunk);
+                if on_cpu {
+                    outs.push(p.to_device(&Device::Cpu)?);
+                } else {
+                    outs.push(p);
+                }
+                st += n;
+            }
+            if outs.len() == 1 {
+                let o = outs.pop().unwrap();
+                if on_cpu {
+                    if o.device().is_cuda() { Ok(o.to_device(&Device::Cpu)?) } else { Ok(o) }
+                } else {
+                    if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(dev)?) }
+                }
+            } else if on_cpu {
+                let cat_cpu = Tensor::cat(&outs, 0)?;
+                drop(outs);
+                Ok(cat_cpu)
+            } else {
+                Ok(Tensor::cat(&outs, 0)?)
+            }
+        };
+
+        let ve = chunked_proj(&self.video_patch_proj, &all_v)?;
+        let ae = chunked_proj(&self.audio_patch_proj, &all_a)?;
+        drop((all_v, all_a));
+
         let mut parts = vec![];
         let (mut vo, mut ao) = (0, 0);
         for &(a, b, k) in &layout.segments {
             let n = b - a;
             match k {
-                Seg::Text => parts.push(run.text.clone()),
+                Seg::Text => {
+                    let txt = if on_cpu { run.text.to_device(&Device::Cpu)? } else { run.text.clone() };
+                    parts.push(txt);
+                }
                 k if k.is_video() => {
                     parts.push(ve.narrow(0, vo, n)?);
                     vo += n;
@@ -1326,8 +1747,12 @@ impl Dit {
                 }
             }
         }
-        let mut x = Tensor::cat(&parts, 0)?;
-        drop((parts, ve, ae, all_v, all_a));
+        drop((ve, ae));
+        let x_cpu_or_gpu = Tensor::cat(&parts, 0)?;
+        drop(parts);
+        let mut x = if on_cpu { x_cpu_or_gpu.to_device(dev)? } else { x_cpu_or_gpu };
+        let (free_vram2, _) = crate::config::vram_info().unwrap_or((0, 0));
+        println!("[dit] forward_inner: x packed shape {:?}, free VRAM={:.2} GB", x.dims(), free_vram2 as f64 / 1e9);
         // the ControlNet branches off the stream as it enters the first block
         let ctrl = match (&self.control, &run.control) {
             (Some(model), Some(rc)) if rc.cond.sigma_end <= sigma_v && sigma_v <= rc.cond.sigma_start => Some((model, rc)),
@@ -1437,52 +1862,54 @@ impl Dit {
         }
 
         // final layer
+        let (free_vram_final, _) = crate::config::vram_info().unwrap_or((0, 0));
+        println!("[dit] forward_inner: final layer start, free VRAM={:.2} GB", free_vram_final as f64 / 1e9);
+
+        let (va, vb) = layout.find(Seg::Video);
+        let (aa, ab) = layout.find(Seg::Audio);
+        let xv = x.narrow(0, va, vb - va)?;
+        let xa = x.narrow(0, aa, ab - aa)?;
+        drop(x);
+
         let fm = self.final_adaln.forward(&t_emb)?.to_dtype(DType::F32)?; // [U, 2*hidden]
         let shift = fm.narrow(1, 0, hidden)?;
         let fscale = fm.narrow(1, hidden, hidden)?;
-        let head_in = |a: usize, b: usize, row: u32| -> Result<Tensor> {
-            let n = ops::rms_norm(&x.narrow(0, a, b - a)?, Some(&self.final_norm), self.cfg.eps)?.to_dtype(DType::F32)?;
-            let sc = fscale.narrow(0, row as usize, 1)?;
-            let sh = shift.narrow(0, row as usize, 1)?;
-            Ok(n.broadcast_mul(&(sc + 1.0)?)?.broadcast_add(&sh)?)
+
+        let project_head_chunked = |t_in: &Tensor, rows_t: Option<&[f64]>, default_row: u32, head: &QLinear| -> Result<Tensor> {
+            let total = t_in.dim(0)?;
+            let chunk_size = 4096;
+            let mut outs = vec![];
+            let mut st = 0;
+            while st < total {
+                let n = chunk_size.min(total - st);
+                let chunk_x = t_in.narrow(0, st, n)?;
+                let n_chunk = ops::rms_norm(&chunk_x, Some(&self.final_norm), self.cfg.eps)?.to_dtype(DType::F32)?;
+                drop(chunk_x);
+                let h_chunk = match rows_t {
+                    Some(rt) => {
+                        let rows = Tensor::from_vec(rt[st..st + n].iter().map(|&t| t_row(t)).collect::<Vec<u32>>(), n, dev)?;
+                        let sc = (fscale.contiguous()?.index_select(&rows, 0)? + 1.0)?;
+                        let sh = shift.contiguous()?.index_select(&rows, 0)?;
+                        (n_chunk.broadcast_mul(&sc)? + sh)?
+                    }
+                    None => {
+                        let sc = (fscale.narrow(0, default_row as usize, 1)? + 1.0)?;
+                        let sh = shift.narrow(0, default_row as usize, 1)?;
+                        n_chunk.broadcast_mul(&sc)?.broadcast_add(&sh)?
+                    }
+                };
+                let out_chunk = head.forward(&h_chunk)?;
+                outs.push(out_chunk);
+                st += n;
+            }
+            if outs.len() == 1 { Ok(outs.pop().unwrap()) } else { Ok(Tensor::cat(&outs, 0)?) }
         };
-        let (va, vb) = layout.find(Seg::Video);
-        let (aa, ab) = layout.find(Seg::Audio);
-        let head_in_rows = |a: usize, b: usize, rows_t: &[f64]| -> Result<Tensor> {
-            let n = ops::rms_norm(&x.narrow(0, a, b - a)?, Some(&self.final_norm), self.cfg.eps)?.to_dtype(DType::F32)?;
-            let rows = Tensor::from_vec(rows_t.iter().map(|&t| t_row(t)).collect::<Vec<u32>>(), rows_t.len(), dev)?;
-            let sc = fscale.contiguous()?.index_select(&rows, 0)?;
-            let sh = shift.contiguous()?.index_select(&rows, 0)?;
-            Ok((((sc + 1.0)? * n)? + sh)?)
-        };
-        let hv = match &v_rows_t {
-            Some(r) => head_in_rows(va, vb, r)?,
-            None => head_in(va, vb, t_row(t_v))?,
-        };
-        let ha = match &a_rows_t {
-            Some(r) => head_in_rows(aa, ab, r)?,
-            None => head_in(aa, ab, t_row(t_a))?,
-        };
-        let (v, a) = if self.pdd_heads == 1 {
-            (self.video_out.forward(&hv)?, self.audio_out.forward(&ha)?)
-        } else {
-            let sig = &run.sample_sigmas;
-            let n = self.pdd_heads;
-            let i = sig
-                .iter()
-                .enumerate()
-                .min_by(|x, y| (x.1 - sigma_v).abs().partial_cmp(&(y.1 - sigma_v).abs()).unwrap())
-                .map(|x| x.0)
-                .unwrap_or(0);
-            let sigma_next = sig[(i + 1).min(sig.len() - 1)];
-            let to_idx = |s: f64| ((1.0 - time_shift_sigma(s, self.cfg.shift_video, 1.0)) * n as f64).round() as usize;
-            let start = to_idx(sigma_v).min(n - 1);
-            let stop = to_idx(sigma_next).max(start + 1);
-            (
-                pdd_head(&self.video_out, &hv, n, start, stop, self.cfg.shift_video)?,
-                pdd_head(&self.audio_out, &ha, n, start, stop, self.cfg.shift_audio)?,
-            )
-        };
+
+        let v = project_head_chunked(&xv, v_rows_t.as_deref(), t_row(t_v), &self.video_out)?;
+        drop(xv);
+
+        let a = project_head_chunked(&xa, a_rows_t.as_deref(), t_row(t_a), &self.audio_out)?;
+        drop(xa);
         let video = unpatchify_video(&v, run.latent_t, run.lat_h / 2, run.lat_w / 2, self.cfg.latents_dim)?;
         let video = video.narrow(2, 0, ot)?.narrow(3, 0, oh)?.narrow(4, 0, ow)?;
         let audio = unpack_audio(&a)?;

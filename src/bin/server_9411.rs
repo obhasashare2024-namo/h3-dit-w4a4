@@ -40,6 +40,12 @@ struct Args {
 
     #[arg(long, default_value_t = 1.0)]
     reserve_gb: f64,
+
+    #[arg(long, default_value_t = 4096)]
+    token_chunk: usize,
+
+    #[arg(long, default_value_t = 2048)]
+    mlp_chunk: usize,
 }
 
 #[derive(Deserialize, Debug)]
@@ -132,6 +138,8 @@ fn worker_loop(
     disk_blocks: i64,
     tier_ratio: Option<String>,
     reserve_gb: f64,
+    token_chunk: usize,
+    mlp_chunk: usize,
     rx: std_mpsc::Receiver<SampleJob>,
 ) {
     println!("[server_9411] Initializing CUDA Device 0 on worker thread...");
@@ -152,6 +160,8 @@ fn worker_loop(
     mem.dit_disk_blocks = disk_blocks;
     mem.tier_ratio = tier_ratio;
     mem.reserve_gb = reserve_gb;
+    mem.token_chunk = token_chunk;
+    mem.mlp_chunk = mlp_chunk;
     mem.offload = h3_rs::weights::Placement::Disk;
 
     let t0 = Instant::now();
@@ -282,6 +292,10 @@ fn worker_loop(
             })
         })();
 
+        if let Err(ref e) = res {
+            eprintln!("[server_9411] Request FAILED with error:
+{e:?}");
+        }
         let _ = job.reply.send(res);
     }
 }
@@ -315,8 +329,10 @@ async fn main() -> std::io::Result<()> {
     let disk_blocks = args.disk_blocks;
     let tier_ratio = args.tier_ratio.clone();
     let reserve_gb = args.reserve_gb;
+    let token_chunk = args.token_chunk;
+    let mlp_chunk = args.mlp_chunk;
     std::thread::spawn(move || {
-        worker_loop(model_path, blocks, vram_blocks, ram_blocks, disk_blocks, tier_ratio, reserve_gb, rx);
+        worker_loop(model_path, blocks, vram_blocks, ram_blocks, disk_blocks, tier_ratio, reserve_gb, token_chunk, mlp_chunk, rx);
     });
 
     let addr = format!("0.0.0.0:{}", args.port);

@@ -601,12 +601,19 @@ pub struct Raw {
 }
 
 impl Raw {
-    /// Output rows `[r0, r0 + n)` of an int8 weight (pairs with [`QLinear::rows`]).
+    /// Output rows `[r0, r0 + n)` of an int8 or w4a4 weight (pairs with [`QLinear::rows`]).
     pub fn rows(&self, r0: usize, n: usize) -> Result<Raw> {
         if self.bs.is_some() {
             bail!("row slices of block-scaled weights are not supported");
         }
-        Ok(Raw { w: self.w.narrow(0, r0, n)?, bs: None })
+        if self.w.rank() == 4 {
+            if r0 % 8 != 0 || n % 8 != 0 {
+                bail!("AmpereW4A4Preswizzled row slice requires r0 and n to be multiples of 8 (got r0={r0}, n={n})");
+            }
+            Ok(Raw { w: self.w.narrow(0, r0 / 8, n / 8)?.contiguous()?, bs: None })
+        } else {
+            Ok(Raw { w: self.w.narrow(0, r0, n)?.contiguous()?, bs: None })
+        }
     }
 }
 
@@ -768,11 +775,19 @@ impl QLinear {
         }
         let mut l = self.clone();
         l.out_features = n;
+        if matches!(self.fmt, QFormat::Dense) {
+            let w = self.weight.get(dev)?;
+            let w_slice = w.narrow(0, r0, n)?.contiguous()?;
+            l.weight = Held::from_tensor(w_slice);
+        }
         if let Some(sc) = &self.scale {
             let t = sc.get(dev)?;
             if t.elem_count() == self.out_features {
                 let rows = t.flatten_all()?.narrow(0, r0, n)?.contiguous()?;
                 l.scale = Some(Held::from_tensor(if t.rank() == 2 { rows.reshape((n, 1))? } else { rows }));
+            } else if t.dim(0)? == self.out_features {
+                let rows = t.narrow(0, r0, n)?.contiguous()?;
+                l.scale = Some(Held::from_tensor(rows));
             }
         }
         l.bias = self.bias.as_ref().map(|b| b.narrow(0, r0, n).and_then(|t| t.contiguous())).transpose()?;

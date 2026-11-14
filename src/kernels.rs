@@ -1455,6 +1455,34 @@ pub fn gate_add(x: &Tensor, y: &Tensor, gate: &Tensor, idx: &Tensor) -> Result<T
     x.contiguous()?.apply_op2_no_bwd(&y.to_dtype(x.dtype())?.contiguous()?, &op)
 }
 
+/// In-place gated residual accumulate: `x += y * gate[idx]`.
+/// `x` can be a narrow contiguous row slice of a larger tensor.
+pub fn gate_add_inplace(x: &Tensor, y: &Tensor, gate: &Tensor, idx: &Tensor) -> Result<()> {
+    let (s, c) = x.dims2()?;
+    let y_cast = y.to_dtype(x.dtype())?.contiguous()?;
+    let (st_x, lx) = x.storage_and_layout();
+    let (st_y, ly) = y_cast.storage_and_layout();
+    need_contig(lx, "gate_add_inplace x")?;
+    need_contig(ly, "gate_add_inplace y")?;
+    match (&*st_x, &*st_y) {
+        (Storage::Cuda(cx), Storage::Cuda(cy)) => {
+            let dev = cx.device().clone();
+            let func = dev.get_or_load_custom_func("gate_add", MODULE, ptx()?)?;
+            let gp = cuda_ptr_of(gate)?;
+            let ip = cuda_ptr_of(idx)?;
+            let xp = dev_ptr(cx, lx)?;
+            let yp = dev_ptr(cy, ly)?;
+            let k = kind_of(x.dtype())?;
+            let (su, cu) = (s as u64, c as u64);
+            let mut b = func.builder();
+            b.arg(&xp).arg(&yp).arg(&k).arg(&gp).arg(&ip).arg(&xp).arg(&su).arg(&cu);
+            unsafe { b.launch(grid_for(s * c)) }.w()?;
+            Ok(())
+        }
+        _ => candle_core::bail!("gate_add_inplace: cuda only"),
+    }
+}
+
 struct Act1d {
     fu: Tensor,
     fd: Tensor,
