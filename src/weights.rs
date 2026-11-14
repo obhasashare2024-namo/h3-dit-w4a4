@@ -1159,11 +1159,11 @@ impl QLinear {
         while start < rows {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
-            let xr = match self.fmt {
-                QFormat::AmpereW4A4Preswizzled { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
-                _ => xc.clone(),
+            let (xr, fused) = match self.fmt {
+                QFormat::AmpereW4A4Preswizzled { convrot: Some(_), .. } => (xc.clone(), true),
+                _ => (xc.clone(), false),
             };
-            let mut y = kernels::gemm_w4a4_preswizzled(&xr, &raw.w, &scale, self.bias.as_ref(), self.out_features)?;
+            let mut y = kernels::gemm_w4a4_preswizzled(&xr, &raw.w, &scale, self.bias.as_ref(), self.out_features, fused)?;
             for l in &self.loras {
                 let a = l.a.to_dtype(x.dtype())?;
                 let b = l.b.to_dtype(x.dtype())?;

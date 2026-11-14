@@ -629,6 +629,109 @@ __device__ __forceinline__ u32 pack_f32x8_to_s4x8(const float v[8], float inv_sc
     return packed;
 }
 
+__device__ __forceinline__ void hadamard4_in_register(
+    float& x0, float& x1, float& x2, float& x3
+) {
+    float s = (x0 + x1) + (x2 + x3);
+    float orig_x0 = x0;
+    float orig_x1 = x1;
+    x0 = __fmaf_rn(-2.0f, x3, s);
+    x1 = __fmaf_rn(-2.0f, x2, s);
+    x2 = __fmaf_rn(-2.0f, orig_x1, s);
+    x3 = __fmaf_rn(-2.0f, orig_x0, s);
+}
+
+__device__ __forceinline__ void convrot_h256_warp_inplace(float r[8]) {
+    constexpr unsigned int FULL_MASK = 0xffffffffu;
+
+    // Stage 1: Stride = 1 (inside register)
+    hadamard4_in_register(r[0], r[1], r[2], r[3]);
+    hadamard4_in_register(r[4], r[5], r[6], r[7]);
+
+    // Stage 2: Stride = 4
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float u0 = r[k];
+        float u1 = r[k + 4];
+        float v0 = __shfl_xor_sync(FULL_MASK, u0, 1);
+        float v1 = __shfl_xor_sync(FULL_MASK, u1, 1);
+        float s  = (u0 + u1) + (v0 + v1);
+        r[k]     = __fmaf_rn(-2.0f, v1, s);
+        r[k + 4] = __fmaf_rn(-2.0f, v0, s);
+    }
+
+    // Stage 3: Stride = 16
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float val = r[m];
+        float s   = val + __shfl_xor_sync(FULL_MASK, val, 2);
+        s        += __shfl_xor_sync(FULL_MASK, s, 4);
+        float opp = __shfl_xor_sync(FULL_MASK, val, 6);
+        r[m]      = __fmaf_rn(-2.0f, opp, s);
+    }
+
+    // Stage 4: Stride = 64
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        float val = r[m];
+        float s   = val + __shfl_xor_sync(FULL_MASK, val, 8);
+        s        += __shfl_xor_sync(FULL_MASK, s, 16);
+        float opp = __shfl_xor_sync(FULL_MASK, val, 24);
+        r[m]      = __fmaf_rn(-2.0f, opp, s) * 0.0625f;
+    }
+}
+
+// 融合 ConvRot 的量化算子：直接接收原始未旋轉的 X (BF16)，在寄存器內正交變換後動態量化
+extern "C" __global__ void quant_act_w4a4_group256_fused_convrot(
+    const u16* __restrict__ X,
+    u32* __restrict__ A_packed,
+    u16* __restrict__ S_x,
+    int M, int K
+) {
+    int num_groups = K >> 8;
+    int total_groups = M * num_groups;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int group_idx = tid >> 5;
+    int lane_id = tid & 31;
+
+    if (group_idx >= total_groups) return;
+
+    int m = group_idx / num_groups;
+    int g = group_idx % num_groups;
+
+    int k_base = (g << 8) + (lane_id << 3);
+    const u16* x_ptr = X + (size_t)m * K + k_base;
+
+    float v[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = bf2f(x_ptr[i]);
+    }
+
+    // 在寄存器內就地進行 ConvRot (H_256) 正交旋轉變換
+    convrot_h256_warp_inplace(v);
+
+    float max_abs = 1e-7f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        max_abs = fmaxf(max_abs, fabsf(v[i]));
+    }
+
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffffu, max_abs, mask));
+    }
+
+    float scale = fmaxf(max_abs / 7.0f, 1e-4f);
+    float inv_scale = 1.0f / scale;
+
+    u32 packed = pack_f32x8_to_s4x8(v, inv_scale);
+    A_packed[(size_t)m * (K >> 3) + (g << 5) + lane_id] = packed;
+    if (lane_id == 0) {
+        S_x[(size_t)m * num_groups + g] = f2h(scale);
+    }
+}
+
 extern "C" __global__ void quant_act_w4a4_group256(
     const u16* __restrict__ X,
     u32* __restrict__ A_packed,
@@ -1800,6 +1903,7 @@ pub fn bilinear_hw(x: &Tensor, ho: usize, wo: usize) -> Result<Tensor> {
 
 struct GemmW4A4Preswizzled {
     out_features: usize,
+    fused_convrot: bool,
 }
 impl CustomOp3 for GemmW4A4Preswizzled {
     fn name(&self) -> &'static str {
@@ -1828,7 +1932,12 @@ impl CustomOp3 for GemmW4A4Preswizzled {
         let dev = x.device().clone();
 
         let ptx_code = ptx()?;
-        let f_quant = dev.get_or_load_custom_func("quant_act_w4a4_group256", MODULE, ptx_code)?;
+        let quant_func = if self.fused_convrot {
+            "quant_act_w4a4_group256_fused_convrot"
+        } else {
+            "quant_act_w4a4_group256"
+        };
+        let f_quant = dev.get_or_load_custom_func(quant_func, MODULE, ptx_code)?;
         let f_gemm = dev.get_or_load_custom_func("ampere_w4a4_group256_gemm_sm86", MODULE, ptx_code)?;
 
         let a_packed = alloc_out(&dev, DType::U32, m * (k / 8))?;
@@ -1870,9 +1979,10 @@ pub fn gemm_w4a4_preswizzled(
     ws: &Tensor,
     bias: Option<&Tensor>,
     out_features: usize,
+    fused_convrot: bool,
 ) -> Result<Tensor> {
     let ws_f16 = ws.to_dtype(DType::F16)?;
-    let y = x.apply_op3_no_bwd(&w.contiguous()?, &ws_f16.contiguous()?, &GemmW4A4Preswizzled { out_features })?;
+    let y = x.apply_op3_no_bwd(&w.contiguous()?, &ws_f16.contiguous()?, &GemmW4A4Preswizzled { out_features, fused_convrot })?;
     if let Some(b) = bias {
         y.broadcast_add(&b.to_dtype(x.dtype())?)
     } else {
