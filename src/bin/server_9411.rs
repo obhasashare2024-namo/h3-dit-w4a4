@@ -142,6 +142,7 @@ fn worker_loop(
             return;
         }
     };
+    h3_rs::kernels::keep_pool_memory(&dev);
 
     println!("[server_9411] Loading W4A4 DiT: {model_path}...");
     let mut mem = MemoryConfig::default();

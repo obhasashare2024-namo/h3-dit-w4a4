@@ -1901,6 +1901,53 @@ pub fn bilinear_hw(x: &Tensor, ho: usize, wo: usize) -> Result<Tensor> {
 }
 
 
+struct W4A4Scratch {
+    a_packed: candle_core::cuda_backend::cudarc::driver::CudaSlice<u32>,
+    s_x: candle_core::cuda_backend::cudarc::driver::CudaSlice<half::f16>,
+    cap_u32: usize,
+    cap_f16: usize,
+}
+
+thread_local! {
+    static W4A4_SCRATCH: std::cell::RefCell<Option<W4A4Scratch>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_w4a4_scratch<F, R>(
+    dev: &candle_core::CudaDevice,
+    need_u32: usize,
+    need_f16: usize,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce(u64, u64) -> Result<R>,
+{
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    W4A4_SCRATCH.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let realloc = borrow
+            .as_ref()
+            .map(|s| s.cap_u32 < need_u32 || s.cap_f16 < need_f16)
+            .unwrap_or(true);
+        if realloc {
+            let cap_u32 = need_u32.max(8192 * (14336 / 8));
+            let cap_f16 = need_f16.max(8192 * (14336 / 256));
+            let a_packed = unsafe { dev.alloc::<u32>(cap_u32)? };
+            let s_x = unsafe { dev.alloc::<half::f16>(cap_f16)? };
+            *borrow = Some(W4A4Scratch {
+                a_packed,
+                s_x,
+                cap_u32,
+                cap_f16,
+            });
+        }
+        let s = borrow.as_ref().unwrap();
+        let stream = dev.cuda_stream();
+        let (ap, _ga) = s.a_packed.device_ptr(&stream);
+        let (sxp, _gs) = s.s_x.device_ptr(&stream);
+        f(ap, sxp)
+    })
+}
+
 struct GemmW4A4Preswizzled {
     out_features: usize,
     fused_convrot: bool,
@@ -1940,34 +1987,33 @@ impl CustomOp3 for GemmW4A4Preswizzled {
         let f_quant = dev.get_or_load_custom_func(quant_func, MODULE, ptx_code)?;
         let f_gemm = dev.get_or_load_custom_func("ampere_w4a4_group256_gemm_sm86", MODULE, ptx_code)?;
 
-        let a_packed = alloc_out(&dev, DType::U32, m * (k / 8))?;
-        let s_x = alloc_out(&dev, DType::F16, m * (k / 256))?;
         let y_out = alloc_out(&dev, DType::BF16, m * n)?;
 
         let xp = dev_ptr(x, xl)?;
-        let ap = out_ptr(&a_packed)?;
-        let sxp = out_ptr(&s_x)?;
         let wp = dev_ptr(w, wl)?;
         let swp = dev_ptr(ws, wsl)?;
         let yp = out_ptr(&y_out)?;
 
-        let num_groups = (k / 256) as u32;
-        let total_groups = (m as u32) * num_groups;
-        let threads = 256u32;
-        let blocks = (total_groups * 32).div_ceil(threads);
-        let mut bld_quant = f_quant.builder();
-        let (mi, ki) = (m as i32, k as i32);
-        bld_quant.arg(&xp).arg(&ap).arg(&sxp).arg(&mi).arg(&ki);
-        let cfg_quant = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
-        unsafe { bld_quant.launch(cfg_quant) }.w()?;
+        with_w4a4_scratch(&dev, m * (k / 8), m * (k / 256), |ap, sxp| {
+            let num_groups = (k / 256) as u32;
+            let total_groups = (m as u32) * num_groups;
+            let threads = 256u32;
+            let blocks = (total_groups * 32).div_ceil(threads);
+            let mut bld_quant = f_quant.builder();
+            let (mi, ki) = (m as i32, k as i32);
+            bld_quant.arg(&xp).arg(&ap).arg(&sxp).arg(&mi).arg(&ki);
+            let cfg_quant = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            unsafe { bld_quant.launch(cfg_quant) }.w()?;
 
-        let grid_x = ((n + 63) / 64) as u32;
-        let grid_y = ((m + 63) / 64) as u32;
-        let ni = n as i32;
-        let mut bld_gemm = f_gemm.builder();
-        bld_gemm.arg(&ap).arg(&wp).arg(&sxp).arg(&swp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
-        let cfg_gemm = LaunchConfig { grid_dim: (grid_x, grid_y, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
-        unsafe { bld_gemm.launch(cfg_gemm) }.w()?;
+            let grid_x = ((n + 63) / 64) as u32;
+            let grid_y = ((m + 63) / 64) as u32;
+            let ni = n as i32;
+            let mut bld_gemm = f_gemm.builder();
+            bld_gemm.arg(&ap).arg(&wp).arg(&sxp).arg(&swp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
+            let cfg_gemm = LaunchConfig { grid_dim: (grid_x, grid_y, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            unsafe { bld_gemm.launch(cfg_gemm) }.w()?;
+            Ok(())
+        })?;
 
         Ok((y_out, Shape::from((m, n))))
     }
