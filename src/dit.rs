@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 
-use crate::config::{resolve_resident, MemoryConfig};
+use crate::config::MemoryConfig;
 use crate::kernels;
 use crate::lora::Lora;
 use crate::ops;
@@ -287,7 +287,10 @@ impl DitConfig {
         let count = |p: &str, suffix: &str| (0..).take_while(|i| f.has(&format!("{p}{i}.{suffix}"))).count();
         let hidden = f.shape("video_patch_proj.weight")?[0];
         let head_dim = f.shape("blocks.0.attn.q_norm.weight")?[0];
-        let qkv = f.shape("blocks.0.attn.qkv_proj.weight")?[0];
+        let qkv_shape = f.shape("blocks.0.attn.qkv_proj.weight")?;
+        let qkv = if qkv_shape.len() == 4 { qkv_shape[0] * 8 } else { qkv_shape[0] };
+        let fc1_shape = f.shape("blocks.0.mlp.fc1.weight")?;
+        let fc1_dim0 = if fc1_shape.len() == 4 { fc1_shape[0] * 8 } else { fc1_shape[0] };
         let (time_embed_dim, curve_grid, tin) = if f.has("adaln_t_table") {
             let s = f.shape("adaln_t_table")?;
             (s[1], Some(s[0]), 256)
@@ -308,7 +311,7 @@ impl DitConfig {
             refiner_layers: count("token_refiner.blocks.", "norm1.weight"),
             heads: qkv / (3 * head_dim),
             head_dim,
-            ffn: f.shape("blocks.0.mlp.fc1.weight")?[0] / 2,
+            ffn: fc1_dim0 / 2,
             latents_dim: f.shape("final_layer.video_out.weight")?[0] / pdd_heads / 4,
             audio_dim: f.shape("final_layer.audio_out.weight")?[0] / pdd_heads,
             text_dim: f.shape("condition_proj.weight")?[1],
@@ -322,15 +325,65 @@ impl DitConfig {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct LowRankLinear {
+    pub(crate) down: QLinear,
+    pub(crate) up: QLinear,
+}
+
+impl LowRankLinear {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mid = self.down.forward(x)?;
+        self.up.forward(&mid)
+    }
+}
+
+pub(crate) enum QkvProj {
+    Fused(QLinear),
+    Factorized {
+        q: LowRankLinear,
+        k: LowRankLinear,
+        v: LowRankLinear,
+    },
+}
+
+impl QkvProj {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            QkvProj::Fused(qkv) => qkv.forward(x),
+            QkvProj::Factorized { q, k, v } => {
+                let q_out = q.forward(x)?;
+                let k_out = k.forward(x)?;
+                let v_out = v.forward(x)?;
+                Ok(Tensor::cat(&[&q_out, &k_out, &v_out], 1)?)
+            }
+        }
+    }
+}
+
+pub(crate) enum LinProj {
+    Single(QLinear),
+    Factorized(LowRankLinear),
+}
+
+impl LinProj {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            LinProj::Single(lin) => lin.forward(x),
+            LinProj::Factorized(lr) => lr.forward(x),
+        }
+    }
+}
+
 pub(crate) struct Block {
     pub(crate) norm1: Tensor,
     pub(crate) norm2: Tensor,
     pub(crate) q_norm: Tensor,
     pub(crate) k_norm: Tensor,
-    pub(crate) qkv: QLinear,
-    pub(crate) out: QLinear,
-    pub(crate) fc1: QLinear,
-    pub(crate) fc2: QLinear,
+    pub(crate) qkv: QkvProj,
+    pub(crate) out: LinProj,
+    pub(crate) fc1: LinProj,
+    pub(crate) fc2: LinProj,
     pub(crate) adaln: QLinear,
 }
 
@@ -377,6 +430,7 @@ pub struct Dit {
     /// Blocks whose weights sit in VRAM now, and how many were at load (`set_resident` moves in between).
     resident: usize,
     base_resident: usize,
+    pub tiers: crate::config::TierDistribution,
     block_bytes: usize,
     final_norm: Tensor,
     final_adaln: QLinear,
@@ -516,12 +570,24 @@ impl Dit {
             .map(|p| f.bytes(&format!("blocks.0.{p}.weight")).map(|b| b.len()).unwrap_or(0))
             .sum();
         let lora_bytes = lora.map(|(l, _)| l.device_bytes()).unwrap_or(0);
-        let resident = resolve_resident(mem.dit_gpu_blocks, cfg.layers, block_bytes, (mem.reserve_gb * 1e9) as usize + lora_bytes + 2_000_000_000);
-        log::info(&format!(
-            "DiT: {resident}/{} blocks resident on GPU ({:.1} GB), rest streamed from {}",
+        let vram_req = if mem.dit_vram_blocks != -1 { mem.dit_vram_blocks } else { mem.dit_gpu_blocks };
+        let tiers = crate::config::resolve_tiers(
             cfg.layers,
-            (resident * block_bytes) as f64 / 1e9,
-            mem.offload
+            vram_req,
+            mem.dit_ram_blocks,
+            mem.dit_disk_blocks,
+            mem.tier_ratio.as_deref(),
+            block_bytes,
+            (mem.reserve_gb * 1e9) as usize + lora_bytes + 500_000_000,
+            1_000_000_000,
+        );
+        let resident = tiers.vram;
+        log::info(&format!(
+            "DiT 3-Tier Allocation: {} VRAM ({:.2} GB) | {} RAM ({:.2} GB) | {} Disk ({:.2} GB) [Total {} blocks]",
+            tiers.vram, (tiers.vram * block_bytes) as f64 / 1e9,
+            tiers.ram, (tiers.ram * block_bytes) as f64 / 1e9,
+            tiers.disk, (tiers.disk * block_bytes) as f64 / 1e9,
+            cfg.layers
         ));
         let mut blocks = vec![];
         for i in 0..cfg.layers {
@@ -529,20 +595,67 @@ impl Dit {
                 let (free, _) = crate::config::vram_info().unwrap_or((0, 0));
                 log::info(&format!("loading block {i}, free VRAM {:.2} GB", free as f64 / 1e9));
             }
-            let place = if i < resident { Placement::Gpu } else { mem.offload };
+            let place = if i < tiers.vram {
+                Placement::Gpu
+            } else if i < tiers.vram + tiers.ram {
+                Placement::Ram
+            } else {
+                Placement::Disk
+            };
             let p = format!("blocks.{i}");
             let ad = if cfg.curve_grid.is_some() { dense_f32(&f, &format!("{p}.adaln_proj.linear"), dev)? } else {
                 QLinear::load(&f, &format!("{p}.adaln_proj.linear"), place, dev, dtype)?
+            };
+            let qkv = if f.has(&format!("{p}.attn.qkv_proj.weight")) {
+                QkvProj::Fused(QLinear::load(&f, &format!("{p}.attn.qkv_proj"), place, dev, dtype)?)
+            } else {
+                let q = LowRankLinear {
+                    down: QLinear::load(&f, &format!("{p}.attn.q_proj.down"), place, dev, dtype)?,
+                    up: QLinear::load(&f, &format!("{p}.attn.q_proj.up"), place, dev, dtype)?,
+                };
+                let k = LowRankLinear {
+                    down: QLinear::load(&f, &format!("{p}.attn.k_proj.down"), place, dev, dtype)?,
+                    up: QLinear::load(&f, &format!("{p}.attn.k_proj.up"), place, dev, dtype)?,
+                };
+                let v = LowRankLinear {
+                    down: QLinear::load(&f, &format!("{p}.attn.v_proj.down"), place, dev, dtype)?,
+                    up: QLinear::load(&f, &format!("{p}.attn.v_proj.up"), place, dev, dtype)?,
+                };
+                QkvProj::Factorized { q, k, v }
+            };
+            let out = if f.has(&format!("{p}.attn.out_proj.weight")) {
+                LinProj::Single(QLinear::load(&f, &format!("{p}.attn.out_proj"), place, dev, dtype)?)
+            } else {
+                LinProj::Factorized(LowRankLinear {
+                    down: QLinear::load(&f, &format!("{p}.attn.out_proj.down"), place, dev, dtype)?,
+                    up: QLinear::load(&f, &format!("{p}.attn.out_proj.up"), place, dev, dtype)?,
+                })
+            };
+            let fc1 = if f.has(&format!("{p}.mlp.fc1.weight")) {
+                LinProj::Single(QLinear::load(&f, &format!("{p}.mlp.fc1"), place, dev, dtype)?)
+            } else {
+                LinProj::Factorized(LowRankLinear {
+                    down: QLinear::load(&f, &format!("{p}.mlp.fc1.down"), place, dev, dtype)?,
+                    up: QLinear::load(&f, &format!("{p}.mlp.fc1.up"), place, dev, dtype)?,
+                })
+            };
+            let fc2 = if f.has(&format!("{p}.mlp.fc2.weight")) {
+                LinProj::Single(QLinear::load(&f, &format!("{p}.mlp.fc2"), place, dev, dtype)?)
+            } else {
+                LinProj::Factorized(LowRankLinear {
+                    down: QLinear::load(&f, &format!("{p}.mlp.fc2.down"), place, dev, dtype)?,
+                    up: QLinear::load(&f, &format!("{p}.mlp.fc2.up"), place, dev, dtype)?,
+                })
             };
             blocks.push(Block {
                 norm1: ld(&f, &format!("{p}.norm1.weight"), dev, dtype)?,
                 norm2: ld(&f, &format!("{p}.norm2.weight"), dev, dtype)?,
                 q_norm: ld(&f, &format!("{p}.attn.q_norm.weight"), dev, dtype)?,
                 k_norm: ld(&f, &format!("{p}.attn.k_norm.weight"), dev, dtype)?,
-                qkv: QLinear::load(&f, &format!("{p}.attn.qkv_proj"), place, dev, dtype)?,
-                out: QLinear::load(&f, &format!("{p}.attn.out_proj"), place, dev, dtype)?,
-                fc1: QLinear::load(&f, &format!("{p}.mlp.fc1"), place, dev, dtype)?,
-                fc2: QLinear::load(&f, &format!("{p}.mlp.fc2"), place, dev, dtype)?,
+                qkv,
+                out,
+                fc1,
+                fc2,
                 adaln: ad,
             });
         }
@@ -581,6 +694,7 @@ impl Dit {
             blocks,
             resident,
             base_resident: resident,
+            tiers,
             block_bytes,
             final_norm: ld(&f, "final_layer.norm.weight", dev, dtype)?,
             final_adaln: dense_f32(&f, "final_layer.adaln_proj.linear", dev)?,
@@ -598,9 +712,11 @@ impl Dit {
         if lora.is_some() && std::env::var("H3_LORA_RUNTIME").is_err() {
             let t = std::time::Instant::now();
             for b in &mut dit.blocks {
-                for l in [&mut b.qkv, &mut b.out, &mut b.fc1, &mut b.fc2, &mut b.adaln] {
-                    l.merge_loras(dev)?;
-                }
+                if let QkvProj::Fused(qkv) = &mut b.qkv { qkv.merge_loras(dev)?; }
+                if let LinProj::Single(out) = &mut b.out { out.merge_loras(dev)?; }
+                if let LinProj::Single(fc1) = &mut b.fc1 { fc1.merge_loras(dev)?; }
+                if let LinProj::Single(fc2) = &mut b.fc2 { fc2.merge_loras(dev)?; }
+                b.adaln.merge_loras(dev)?;
             }
             for b in &mut dit.refiner {
                 for l in [&mut b.qkv, &mut b.out, &mut b.fc1, &mut b.fc2] {
@@ -611,10 +727,17 @@ impl Dit {
         }
         if crate::weights::int8_enabled() {
             for b in &mut dit.blocks {
-                b.fc1.interleave_swiglu()?;
+                if let LinProj::Single(fc1) = &mut b.fc1 {
+                    fc1.interleave_swiglu()?;
+                }
             }
         }
         Ok(dit)
+    }
+
+    /// 3-Tier distribution across VRAM, RAM, and Disk.
+    pub fn tiers(&self) -> crate::config::TierDistribution {
+        self.tiers
     }
 
     /// Blocks resident in VRAM now.
@@ -639,12 +762,18 @@ impl Dit {
         let n = n.min(self.base_resident);
         let dev = self.dev.clone();
         for (i, b) in self.blocks.iter_mut().enumerate().take(self.base_resident) {
-            for l in [&mut b.qkv, &mut b.out, &mut b.fc1, &mut b.fc2] {
-                if i >= n {
-                    l.weight.demote(&dev)?;
-                } else {
-                    l.weight.promote(&dev)?;
-                }
+            let demote = i >= n;
+            if let QkvProj::Fused(qkv) = &mut b.qkv {
+                if demote { qkv.weight.demote(&dev)?; } else { qkv.weight.promote(&dev)?; }
+            }
+            if let LinProj::Single(out) = &mut b.out {
+                if demote { out.weight.demote(&dev)?; } else { out.weight.promote(&dev)?; }
+            }
+            if let LinProj::Single(fc1) = &mut b.fc1 {
+                if demote { fc1.weight.demote(&dev)?; } else { fc1.weight.promote(&dev)?; }
+            }
+            if let LinProj::Single(fc2) = &mut b.fc2 {
+                if demote { fc2.weight.demote(&dev)?; } else { fc2.weight.promote(&dev)?; }
             }
         }
         self.resident = n;
@@ -667,10 +796,10 @@ impl Dit {
             Ok(())
         };
         for (i, b) in self.blocks.iter_mut().enumerate() {
-            attach(&mut b.qkv, &format!("blocks.{i}.attn.qkv_proj"))?;
-            attach(&mut b.out, &format!("blocks.{i}.attn.out_proj"))?;
-            attach(&mut b.fc1, &format!("blocks.{i}.mlp.fc1"))?;
-            attach(&mut b.fc2, &format!("blocks.{i}.mlp.fc2"))?;
+            if let QkvProj::Fused(qkv) = &mut b.qkv { attach(qkv, &format!("blocks.{i}.attn.qkv_proj"))?; }
+            if let LinProj::Single(out) = &mut b.out { attach(out, &format!("blocks.{i}.attn.out_proj"))?; }
+            if let LinProj::Single(fc1) = &mut b.fc1 { attach(fc1, &format!("blocks.{i}.mlp.fc1"))?; }
+            if let LinProj::Single(fc2) = &mut b.fc2 { attach(fc2, &format!("blocks.{i}.mlp.fc2"))?; }
             attach(&mut b.adaln, &format!("blocks.{i}.adaln_proj.linear"))?;
         }
         for (i, b) in self.refiner.iter_mut().enumerate() {
@@ -775,14 +904,14 @@ impl Dit {
     /// Attention of one block, `groups` heads groups at a time (see [`attn_groups`](Self::attn_groups)); consumes
     /// `n1`, the modulated input of the qkv projection.
     #[allow(clippy::too_many_arguments)]
-    fn attend_grouped(&self, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<Tensor> {
+    fn attend_grouped_qkv(&self, qkv: &QLinear, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<Tensor> {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let inner = h * d;
         let (hg, w) = (h / groups, h / groups * d);
         let s = n1.dim(0)?;
         let proj = |base: usize, g: usize| -> Result<Tensor> {
             let r0 = base + g * w;
-            b.qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
+            qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
         };
         let mut outs = Vec::with_capacity(groups);
         for g in 0..groups {
@@ -966,9 +1095,8 @@ impl Dit {
 
     /// One transformer block over the packed stream `x` (shared by the base blocks and the ControlNet's), given its
     /// weights already fetched as `[qkv, out, fc1, fc2]`.
-    pub(crate) fn run_block(&self, b: &Block, raws: [crate::weights::Raw; 4], mut x: Tensor, cx: &StepCtx) -> Result<Tensor> {
+    pub(crate) fn run_block(&self, b: &Block, raws: Option<[crate::weights::Raw; 4]>, mut x: Tensor, cx: &StepCtx) -> Result<Tensor> {
         let dev = &self.dev;
-        let [r_qkv, r_out, r_fc1, r_fc2] = raws;
         let (h, d, hidden) = (self.cfg.heads, self.cfg.head_dim, self.cfg.hidden);
         let rot = cx.rope.dim(2)? * 2;
         let chunk = self.mem.token_chunk;
@@ -980,41 +1108,55 @@ impl Dit {
         let (shift_mlp, scale_mlp, gate_mlp) = (c(3)?, c(4)?, c(5)?);
 
         let n1 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?;
-        let groups = self.attn_groups(n1.dim(0)?, &b.qkv);
-        let att = if groups > 1 {
-            self.attend_grouped(b, n1, &r_qkv, cx.rope, rot, groups, chunk)?
-        } else {
-            let qkv = prof::time("qkv linear", dev, || b.qkv.forward_raw(&n1, &r_qkv, chunk))?;
-            drop(n1);
-            let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(cx.rope), rot, h, d))?;
-            drop(qkv);
-            att
-        };
-        let o = prof::time("out linear", dev, || b.out.forward_raw(&att, &r_out, chunk))?;
+        let qkv = prof::time("qkv linear", dev, || match (&b.qkv, &raws) {
+            (QkvProj::Fused(qkv), Some([r_qkv, ..])) => {
+                let groups = self.attn_groups(n1.dim(0)?, qkv);
+                if groups > 1 {
+                    self.attend_grouped_qkv(qkv, b, n1.clone(), r_qkv, cx.rope, rot, groups, chunk)
+                } else {
+                    qkv.forward_raw(&n1, r_qkv, chunk)
+                }
+            }
+            _ => b.qkv.forward(&n1),
+        })?;
+        drop(n1);
+        let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(cx.rope), rot, h, d))?;
+        drop(qkv);
+
+        let o = prof::time("out linear", dev, || match (&b.out, &raws) {
+            (LinProj::Single(out), Some([_, r_out, ..])) => out.forward_raw(&att, r_out, chunk),
+            _ => b.out.forward(&att),
+        })?;
         drop(att);
         x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, cx.idx))?;
         drop(o);
 
         let n2 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, cx.idx)?) })?;
-        let w1 = prof::time("dequant", dev, || b.fc1.prepare(r_fc1.clone(), dev, self.dtype))?;
-        let w2 = prof::time("dequant", dev, || b.fc2.prepare(r_fc2.clone(), dev, self.dtype))?;
-        drop((r_qkv, r_out, r_fc1, r_fc2));
         let s = n2.dim(0)?;
-        let mut outs = vec![];
-        let mc = self.mem.mlp_chunk.max(1);
-        let mut st = 0;
-        prof::time("mlp", dev, || -> Result<()> {
-            while st < s {
-                let n = mc.min(s - st);
-                let hc = b.fc1.run_swiglu(&n2.narrow(0, st, n)?, &w1, usize::MAX)?;
-                outs.push(b.fc2.run(&hc, &w2, usize::MAX)?);
-                st += n;
+        let mo = prof::time("mlp", dev, || -> Result<Tensor> {
+            match (&b.fc1, &b.fc2, &raws) {
+                (LinProj::Single(fc1), LinProj::Single(fc2), Some([_, _, r_fc1, r_fc2])) => {
+                    let w1 = prof::time("dequant", dev, || fc1.prepare(r_fc1.clone(), dev, self.dtype))?;
+                    let w2 = prof::time("dequant", dev, || fc2.prepare(r_fc2.clone(), dev, self.dtype))?;
+                    let mut outs = vec![];
+                    let mc = self.mem.mlp_chunk.max(1);
+                    let mut st = 0;
+                    while st < s {
+                        let n = mc.min(s - st);
+                        let hc = fc1.run_swiglu(&n2.narrow(0, st, n)?, &w1, usize::MAX)?;
+                        outs.push(fc2.run(&hc, &w2, usize::MAX)?);
+                        st += n;
+                    }
+                    drop((w1, w2));
+                    if outs.len() == 1 { Ok(outs.pop().unwrap()) } else { Ok(Tensor::cat(&outs, 0)?) }
+                }
+                _ => {
+                    let h1 = b.fc1.forward(&n2)?;
+                    let hc = ops::swiglu(&h1)?;
+                    b.fc2.forward(&hc)
+                }
             }
-            Ok(())
         })?;
-        drop((w1, w2, n2));
-        let mo = Tensor::cat(&outs, 0)?;
-        drop(outs);
         x = kernels::gate_add(&x, &mo, &gate_mlp, cx.idx)?;
 
         Ok(x)
@@ -1157,13 +1299,20 @@ impl Dit {
         let curve = self.adaln_t_table.is_some();
         let hidden = self.cfg.hidden;
         let cx = StepCtx { t_emb: &t_emb, curve, idx: &idx, rope: &run.rope, u: unique.len() };
-        let fetch = |b: &Block| -> Result<[crate::weights::Raw; 4]> { Ok([b.qkv.fetch(dev)?, b.out.fetch(dev)?, b.fc1.fetch(dev)?, b.fc2.fetch(dev)?]) };
-        let mut next = Some(fetch(&self.blocks[0])?);
+        let fetch = |b: &Block| -> Result<Option<[crate::weights::Raw; 4]>> {
+            match (&b.qkv, &b.out, &b.fc1, &b.fc2) {
+                (QkvProj::Fused(qkv), LinProj::Single(out), LinProj::Single(fc1), LinProj::Single(fc2)) => {
+                    Ok(Some([qkv.fetch(dev)?, out.fetch(dev)?, fc1.fetch(dev)?, fc2.fetch(dev)?]))
+                }
+                _ => Ok(None),
+            }
+        };
+        let mut next = fetch(&self.blocks[0])?;
         let mut prev_marker: Option<crate::weights::Marker> = None;
         for (bi, b) in self.blocks.iter().enumerate() {
             crate::progress::check()?;
-            let [r_qkv, r_out, r_fc1, r_fc2] = next.take().unwrap();
-            x = self.run_block(b, [r_qkv, r_out, r_fc1, r_fc2], x, &cx)?;
+            let raws = next.take();
+            x = self.run_block(b, raws, x, &cx)?;
             if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
                 if ci == 0 {
                     cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);
@@ -1178,7 +1327,7 @@ impl Dit {
             }
             prev_marker = Some(crate::weights::Marker::record(dev));
             if bi + 1 < self.blocks.len() {
-                next = Some(fetch(&self.blocks[bi + 1])?);
+                next = fetch(&self.blocks[bi + 1])?;
             }
             if self.capture_blocks.contains(&bi) {
                 self.captured.borrow_mut().push((bi, x.clone()));

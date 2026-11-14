@@ -458,7 +458,8 @@ impl Held {
             Placement::Gpu => Held::Dev(file.load(name, dev)?),
             Placement::Ram => {
                 let i = file.info(name)?;
-                let pinned = if SafeFile::storage_dtype(&i.dtype)? == DType::U8 { pin_bytes(file.bytes(name)?, dev) } else { None };
+                let dt = SafeFile::storage_dtype(&i.dtype)?;
+                let pinned = if dt == DType::U8 || dt == DType::I32 || dt == DType::U32 { pin_bytes(file.bytes(name)?, dev) } else { None };
                 match pinned {
                     Some(buf) => Held::Pinned { buf, shape: i.shape.clone() },
                     None => Held::Host(file.load(name, &Device::Cpu)?),
@@ -487,7 +488,8 @@ impl Held {
             Held::Pinned { buf, shape } => upload_u8_async(&**buf, shape, dev)?,
             Held::File { file, name } => {
                 let i = file.info(name)?;
-                if SafeFile::storage_dtype(&i.dtype)? == DType::U8 && dev.is_cuda() {
+                let dt = SafeFile::storage_dtype(&i.dtype)?;
+                if (dt == DType::U8 || dt == DType::I32 || dt == DType::U32) && dev.is_cuda() {
                     upload_from_file(file, name, &i.shape, dev)?
                 } else {
                     file.load(name, dev)?

@@ -5,6 +5,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::weights::Placement;
 
+/// 3-Tier weight allocation distribution across VRAM, pinned host RAM, and NVMe disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierDistribution {
+    pub vram: usize,
+    pub ram: usize,
+    pub disk: usize,
+}
+
+impl TierDistribution {
+    pub fn new(vram: usize, ram: usize, disk: usize) -> Self {
+        Self { vram, ram, disk }
+    }
+}
+
 /// How the pipeline spends VRAM and RAM. Every field has a preset default; see `configs/*.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -12,6 +26,14 @@ pub struct MemoryConfig {
     /// DiT transformer blocks (of 50, ~0.39 GB each as int8) kept resident on the GPU. The rest
     /// are uploaded from `offload` every sampling step. `-1` = as many as fit (auto).
     pub dit_gpu_blocks: i64,
+    /// Explicit count of DiT blocks placed in Tier 1 (VRAM). Default -1 = auto-resolve.
+    pub dit_vram_blocks: i64,
+    /// Explicit count of DiT blocks placed in Tier 2 (pinned host RAM). Default -1 = auto-resolve.
+    pub dit_ram_blocks: i64,
+    /// Explicit count of DiT blocks placed in Tier 3 (NVMe disk). Default -1 = remainder of blocks.
+    pub dit_disk_blocks: i64,
+    /// 3-Tier allocation ratio string (e.g. "23:14:10" or "0.5:0.3:0.2"). If set, overrides explicit counts.
+    pub tier_ratio: Option<String>,
     /// Qwen3-VL text encoder layers (of 50, ~0.31 GB each as nvfp4) resident while encoding.
     /// `-1` = auto.
     pub te_gpu_layers: i64,
@@ -65,6 +87,10 @@ impl Preset {
     pub fn config(self) -> MemoryConfig {
         let base = MemoryConfig {
             dit_gpu_blocks: -1,
+            dit_vram_blocks: -1,
+            dit_ram_blocks: -1,
+            dit_disk_blocks: -1,
+            tier_ratio: None,
             te_gpu_layers: 50,
             offload: Placement::Ram,
             te_offload: None,
@@ -129,11 +155,83 @@ impl MemoryConfig {
 pub fn vram_info() -> Result<(usize, usize)> {
     crate::kernels::trim_pool();
     #[cfg(feature = "cuda")]
-    { candle_core::cuda_backend::cudarc::driver::result::mem_get_info().map_err(|e| anyhow::anyhow!("mem_get_info: {e:?}")) }
+    { return candle_core::cuda_backend::cudarc::driver::result::mem_get_info().map_err(|e| anyhow::anyhow!("mem_get_info: {e:?}")); }
     #[cfg(feature = "mlx")]
-    { crate::apple::memory_info() }
+    { return crate::apple::memory_info(); }
     #[cfg(not(any(feature = "cuda", feature = "mlx")))]
-    { bail!("select the cuda or mlx backend") }
+    { bail!("select the cuda or mlx backend"); }
+}
+
+/// Available system host RAM in bytes.
+pub fn available_ram() -> usize {
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if line.starts_with("MemAvailable:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<usize>() {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+    4 * 1024 * 1024 * 1024
+}
+
+/// Resolve 3-tier distribution (VRAM, RAM, Disk) across total layers.
+pub fn resolve_tiers(
+    total: usize,
+    vram_req: i64,
+    ram_req: i64,
+    disk_req: i64,
+    tier_ratio: Option<&str>,
+    unit_bytes: usize,
+    vram_reserve_bytes: usize,
+    ram_reserve_bytes: usize,
+) -> TierDistribution {
+    if let Some(r) = tier_ratio {
+        let parts: Vec<f64> = r.split(':').filter_map(|s| s.parse().ok()).collect();
+        if parts.len() == 3 {
+            let sum: f64 = parts.iter().sum();
+            if sum > 0.0 {
+                let v = ((parts[0] / sum) * total as f64).round() as usize;
+                let v = v.min(total);
+                let r_alloc = ((parts[1] / sum) * total as f64).round() as usize;
+                let r_alloc = r_alloc.min(total - v);
+                let d = total - v - r_alloc;
+                return TierDistribution::new(v, r_alloc, d);
+            }
+        }
+    }
+
+    // 1. Resolve VRAM
+    let vram = if vram_req >= 0 {
+        (vram_req as usize).min(total)
+    } else {
+        let free_vram = vram_info().map(|(f, _)| f).unwrap_or(0);
+        (free_vram.saturating_sub(vram_reserve_bytes) / unit_bytes.max(1)).min(total)
+    };
+
+    let remaining = total - vram;
+
+    // 2. Resolve RAM
+    let ram = if ram_req >= 0 {
+        (ram_req as usize).min(remaining)
+    } else {
+        let avail_ram = available_ram();
+        let safe_ram = avail_ram.saturating_sub(ram_reserve_bytes);
+        (safe_ram / unit_bytes.max(1)).min(remaining)
+    };
+
+    // 3. Resolve Disk
+    let disk = if disk_req >= 0 {
+        (disk_req as usize).min(total - vram - ram)
+    } else {
+        total - vram - ram
+    };
+
+    TierDistribution::new(vram, ram, disk)
 }
 
 /// Resolve a "count of resident units" budget: explicit values clamp to `total`, `-1` fits as many

@@ -93,3 +93,8 @@ required-features = ["cuda"]
 [[example]]
 name = "test_w4a4"
 required-features = ["cuda"]
+
+[[bin]]
+name = "server_9411"
+path = "src/bin/server_9411.rs"
+required-features = ["serve", "cuda"]
