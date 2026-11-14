@@ -587,7 +587,9 @@ impl Dit {
         #[cfg(feature = "cuda")]
         crate::kernels::keep_pool_memory(dev);
         #[cfg(feature = "cuda")]
-        let streaming = if dev.is_cuda() && tiers.vram < cfg.layers {
+        let is_w4a4_preswizzled = f.metadata.get("h3.quant.format").map(|s| s == "ampere_w4a4_group256_preswizzled").unwrap_or(false)
+            || f.has("blocks.0.attn.qkv_proj.weight_scale");
+        let streaming = if dev.is_cuda() && tiers.vram < cfg.layers && is_w4a4_preswizzled {
             let max_slot_bytes = (block_bytes + 4096).next_multiple_of(4096);
             log::info(&format!(
                 "StreamingEngine: initializing 3-tier streaming ({} VRAM, {} RAM, {} Disk, slot {} MB)",
