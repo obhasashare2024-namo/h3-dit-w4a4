@@ -955,6 +955,13 @@ impl Dit {
         if let Some(g) = std::env::var("H3_ATTN_GROUPS").ok().and_then(|v| v.parse::<usize>().ok()) {
             return if g >= 1 && self.cfg.heads % g == 0 { g } else { 1 };
         }
+        if tokens > 140000 {
+            return 28;
+        } else if tokens > 85000 {
+            return 14;
+        } else if tokens > 55000 {
+            return 4;
+        }
         let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
         let is_w4a4 = matches!(lin.fmt, crate::weights::QFormat::AmpereW4A4Preswizzled { .. });
         let is_attn8 = crate::attn8::available_arch(&self.dev);
@@ -992,15 +999,21 @@ impl Dit {
         let chunk = self.mem.token_chunk.max(1);
         println!("[attend_factorized] start: s={}, groups={}, w={}, chunk={}, free VRAM={:.2} GB", s, groups, w, chunk, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
 
+        let inner = h * d;
+        let offload_att = s > 140000;
+        let att_bytes = if !offload_att { s * inner * 2 } else { 0 };
         let needed_mid_bytes = 3 * s * 768 * 2;
         let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
-        let offload_mid = s > 30000 && free_vram_start < needed_mid_bytes + 1_500_000_000;
+        let offload_mid = s > 85000 || (s > 30000 && free_vram_start < needed_mid_bytes + 1_500_000_000);
         let (mid_q, mid_k, mid_v) = if offload_mid {
-            println!("[attend_factorized] offloading mid_q/k/v to CPU, free VRAM={:.2} GB", free_vram_start as f64 / 1e9);
+            println!("[attend_factorized] offloading mid_q/k/v to CPU (s={}, free VRAM={:.2} GB, required={:.2} GB)", s, free_vram_start as f64 / 1e9, (needed_mid_bytes + att_bytes) as f64 / 1e9);
             let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
             let mid_k_cpu = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
             let mid_v_cpu = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
             drop(n1);
+            let _ = self.dev.synchronize();
+            let (free_after_drop, _) = crate::config::vram_info().unwrap_or((0, 0));
+            println!("[attend_factorized] dropped n1, free VRAM restored to {:.2} GB, moving mid_q/k/v back to GPU", free_after_drop as f64 / 1e9);
             let mid_q = mid_q_cpu.to_device(&self.dev)?;
             let mid_k = mid_k_cpu.to_device(&self.dev)?;
             let mid_v = mid_v_cpu.to_device(&self.dev)?;
@@ -1011,11 +1024,9 @@ impl Dit {
             let mid_k = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?;
             let mid_v = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?;
             drop(n1);
+            let _ = self.dev.synchronize();
             (mid_q, mid_k, mid_v)
         };
-
-        let inner = h * d;
-        let offload_att = s > 130000;
         println!("[attend_factorized] offload_att={} (s={})", offload_att, s);
 
         let att_full = if !offload_att {
@@ -1067,6 +1078,7 @@ impl Dit {
             }
         }
         drop((mid_q, mid_k, mid_v));
+        let _ = self.dev.synchronize();
         if let Some(full) = att_full {
             println!("[attend_factorized] Zero-Copy Fastpath via Inplace Copy: returning full GPU tensor!");
             Ok(full)
@@ -1089,7 +1101,7 @@ impl Dit {
             let r0 = base + g * w;
             qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
         };
-        let offload_att = s > 130000;
+        let offload_att = s > 140000;
         println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, offload_att={}", s, groups, w, offload_att);
         let att_full = if !offload_att {
             println!("[attend_grouped_qkv] Preallocating att_full on GPU: [{}, {}]", s, inner);
@@ -1342,17 +1354,14 @@ impl Dit {
                     }
                 } else {
                     let tokens = x.dim(0)?;
-                    let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
-                    let budget: usize = std::env::var("H3_ATTN_BUDGET")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(800_000_000);
-                    if qkv_bytes <= budget {
-                        1
+                    if tokens > 140000 {
+                        28 // 12s+: 2 heads per group, single QKV = 280MB, 256-byte aligned
+                    } else if tokens > 85000 {
+                        14 // 8s: 4 heads per group, single QKV = 372MB, 256-byte aligned
+                    } else if tokens > 55000 {
+                        4  // 5s: 14 heads per group, single QKV = 860MB, validated 306s
                     } else {
-                        let want = qkv_bytes.div_ceil(budget);
-                        let res = (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads);
-                        res
+                        4  // 3s: 14 heads per group, validated 137s
                     }
                 }
             }
@@ -1396,6 +1405,8 @@ impl Dit {
 
         let s = att.dim(0)?;
         let mut x = if let Some(x_cpu) = x_saved {
+            let (free_x, _) = crate::config::vram_info().unwrap_or((0, 0));
+            println!("[dit] run_block: transferring x from CPU back to GPU, free VRAM={:.2} GB, required={:.2} GB", free_x as f64 / 1e9, (s * 5376 * 2) as f64 / 1e9);
             x_cpu.to_device(dev_ref)?
         } else {
             x_holder.unwrap()
