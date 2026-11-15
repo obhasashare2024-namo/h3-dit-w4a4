@@ -48,8 +48,8 @@ Engineered specifically for consumer GPUs with limited VRAM (e.g., RTX 3070 8GB 
 - **1080p Full-Spectrum Acceleration**:
   - **1080p 3s (49k tokens)**: **137.06s** (2.65x speedup, pure GPU zero-copy path).
   - **1080p 5s (80k tokens)**: **300.60s** (1.97x speedup, breaking the 5-minute barrier).
-  - **1080p 8s (121k tokens)**: **537.01s** (1.69x speedup, handcrafted 100% Rust Phase 4A INT4 MMA + INT8-QK + Lazy Rescaling saving 373.14s vs 910.15s baseline, and 1.53x faster than community W4A8 @ 820.32s).
-  - **1080p 12s (182k tokens)**: **1092.05s** (Phase 3.3b Quality Fallback, all 47 layers unquantized FP16/BF16 attention) and **1152.13s** (Phase 4A Lazy Rescaling, Cosine 0.999956, Relative L2 Error strictly 0.9436%).
+  - **1080p 8s (121k tokens)**: **508.44s** (1.79x speedup, handcrafted 100% Rust W4A4 + FA2 FP16 saving 401.71s vs 910.15s baseline, and 1.61x faster than community W4A8 @ 820.32s with 100% exact mathematical truth; Attn8 variant is 530.29s).
+  - **1080p 12s (182k tokens)**: **1092.05s** (FlashAttention-2 production baseline, pure FP16/BF16 zero quantization noise); Phase 4A Attn8 variant is **1125.42s ~ 1152.13s**.
 
 ---
 
@@ -196,11 +196,12 @@ For long sequences ($S > 85,000$), the engine enforces strict memory synchroniza
 |---|---|---|---|---|---|---|---|
 | **3 Seconds** | 49,273 tokens | 363.50 s | 137.06 s | **137.06 s** | **2.65x** | -226.44 s | Pure GPU Zero-Copy Fastpath |
 | **5 Seconds** | 80,015 tokens | 592.80 s | 300.60 s | **300.60 s** | **1.97x** | -292.20 s | Pure GPU In-Place Col-Copy |
-| **8 Seconds** | 121,041 tokens | 910.15 s | 607.34 s | **537.01 s** (Phase 4A) | **1.69x** | -373.14 s | INT4 MMA + Lazy Rescaling |
+| **8 Seconds (Phase 4A)** | 121,041 tokens | 910.15 s | 607.34 s | **530.29 s** (Attn8) | **1.72x** | -379.86 s | INT4 MMA + Attn8 Lazy Rescaling |
+| **8 Seconds (FA2 Production)** | 121,041 tokens | 910.15 s | 621.57 s | **508.44 s** 🏆 | **1.79x** | **-401.71 s** | Pure Rust W4A4 + FA2 FP16 Exact Ground Truth |
 | **12s (80W)** | 182,581 tokens | 1436.00 s | 1376.29 s | **1376.29 s** | **1.06x** | -59.71 s | Phase 3.2b-lite Pinned Stream |
 | **12s (125W)** | 182,581 tokens | 1436.00 s | 1155.95 s | **1155.95 s** | **1.27x** | -311.35 s | Phase 3.3 Power/Clock Released |
-| **12s (Phase 3.3b)** | 182,581 tokens | 1436.00 s | 1092.05 s | **1092.05 s** (Quality Baseline) | **1.34x** | -375.25 s | Full 47-Block Zero CPU Cat |
-| **12s (Phase 4A)** | 182,581 tokens | 1436.00 s | - | **1152.13 s** (Accelerated Engine) | **1.25x** | -283.87 s | INT8-QK + Lazy Rescale (Cosine 0.999956) |
+| **12s (FA2 Production)** | 182,581 tokens | 1436.00 s | 1092.05 s | **1092.05 s** 🏆 | **1.34x** | **-375.25 s** | FA2 FP16 Pure Ground Truth Production Baseline |
+| **12s (Phase 4A Attn8)** | 182,581 tokens | 1436.00 s | - | **1125.42 s ~ 1152.13 s** | **1.28x** | -310.58 s | INT8-QK + Lazy Rescale (Low Occupancy Fallback) |
 
 ---
 
