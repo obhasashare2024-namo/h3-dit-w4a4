@@ -998,11 +998,11 @@ impl Dit {
         rope: &Tensor,
         rot: usize,
         groups: usize,
-    ) -> Result<Tensor> {
+        chunk: usize,
+    ) -> Result<AttResult> {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let (hg, w) = (h / groups, h / groups * d);
         let s = n1.dim(0)?;
-        let chunk = self.mem.token_chunk.max(1);
         println!("[attend_factorized] start: s={}, groups={}, w={}, chunk={}, free VRAM={:.2} GB", s, groups, w, chunk, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
 
         let inner = h * d;
@@ -1035,6 +1035,13 @@ impl Dit {
         };
         println!("[attend_factorized] offload_att={} (s={})", offload_att, s);
 
+        let pinned_att = if offload_att {
+            println!("[attend_factorized] Using Phase 3.3b Pinned Host Attention Buffer (Zero CPU Cat)");
+            Some(crate::pinned_att::get_or_create_pinned_att(s, groups, w)?)
+        } else {
+            None
+        };
+
         let att_full = if !offload_att {
             println!("[attend_factorized] Preallocating att_full on GPU: [{}, {}]", s, inner);
             Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
@@ -1042,7 +1049,7 @@ impl Dit {
             None
         };
 
-        let mut outs = if offload_att { Vec::with_capacity(groups) } else { Vec::new() };
+        let mut outs = if offload_att && pinned_att.is_none() { Vec::with_capacity(groups) } else { Vec::new() };
         for g in 0..groups {
             let r0 = g * w;
             let q_up = q.up.rows(r0, w, &self.dev)?;
@@ -1079,6 +1086,9 @@ impl Dit {
             if let Some(ref full) = att_full {
                 kernels::copy_slice_col_inplace(full, &o, g * w)?;
                 drop(o);
+            } else if let Some(ref pbuf) = pinned_att {
+                prof::time("d2h pinned o factorized", &self.dev, || pbuf.write_group_async(g, &o))?;
+                drop(o);
             } else {
                 outs.push(o.to_device(&Device::Cpu)?);
             }
@@ -1087,14 +1097,18 @@ impl Dit {
         let _ = self.dev.synchronize();
         if let Some(full) = att_full {
             println!("[attend_factorized] Zero-Copy Fastpath via Inplace Copy: returning full GPU tensor!");
-            Ok(full)
+            Ok(AttResult::Gpu(full))
+        } else if let Some(pbuf) = pinned_att {
+            println!("[attend_factorized] Phase 3.3b: returning PinnedHost Attention Buffer!");
+            Ok(AttResult::Pinned(pbuf))
         } else if outs.len() == 1 {
             let o = outs.pop().unwrap();
-            if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
+            let o = if o.device().is_cuda() { o } else { o.to_device(&self.dev)? };
+            Ok(AttResult::Gpu(o))
         } else {
             let o_cpu = Tensor::cat(&outs, 1)?;
             drop(outs);
-            Ok(o_cpu)
+            Ok(AttResult::Gpu(o_cpu))
         }
     }
 
@@ -1418,7 +1432,7 @@ impl Dit {
                 AttResult::Gpu(att)
             }
             QkvProj::Factorized { q, k, v } => {
-                AttResult::Gpu(self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups)?)
+                self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups, chunk)?
             }
         };
 

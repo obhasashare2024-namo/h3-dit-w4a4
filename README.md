@@ -180,6 +180,7 @@ For long sequences ($S > 85,000$), the engine enforces strict memory synchroniza
 | **8 Seconds** | 121,041 tokens | 910.15 s | **607.34 s** | **1.50x** | -302.81 s | VRAM Threshold Refined (Pure Forward) |
 | **12s (80W)** | 182,581 tokens | 1436.00 s | **1376.29 s** | **1.06x** | -59.71 s | Phase 3.2b-lite Pinned Stream |
 | **12s (125W)** | 182,581 tokens | 1436.00 s | **1155.95 s** | **1.27x** | -311.35 s | Phase 3.3 Power/Clock Released |
+| **12s (Phase 3.3b)** | 182,581 tokens | 1436.00 s | **1092.05 s** | **1.34x** | -375.25 s | Full 47-Block Zero CPU Cat (Sub-1100s) |
 
 ### Numerical Rigor & Bit-Level Verification
 All generated latents have been strictly verified against golden FP32 baselines to eliminate silent numerical drift:
