@@ -177,6 +177,10 @@ RTX 3070 8GB / RTX 4060Ti などの低 VRAM コンシューマ向け GPU に特�
 
 ## リポジトリブランチ構成と変遷史
 
+> [!NOTE]
+> 各ブランチの詳細と進捗レポート：[docs/BRANCH_PROGRESS_ja.md](docs/BRANCH_PROGRESS_ja.md)
+
+
 ```
 [ Git ブランチトポロジー & ライフサイクル ]
 - w4a8-accel / w4a4-accel   --> sm_86 INT4/INT8 Tensor Core アセンブリ検証および 4D Swizzle。
