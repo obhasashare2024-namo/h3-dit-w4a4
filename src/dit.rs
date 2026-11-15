@@ -1004,7 +1004,7 @@ impl Dit {
         let att_bytes = if !offload_att { s * inner * 2 } else { 0 };
         let needed_mid_bytes = 3 * s * 768 * 2;
         let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
-        let offload_mid = s > 85000 || (s > 30000 && free_vram_start < needed_mid_bytes + 1_500_000_000);
+        let offload_mid = s > 140000 || (s > 30000 && free_vram_start < needed_mid_bytes + att_bytes + 500_000_000);
         let (mid_q, mid_k, mid_v) = if offload_mid {
             println!("[attend_factorized] offloading mid_q/k/v to CPU (s={}, free VRAM={:.2} GB, required={:.2} GB)", s, free_vram_start as f64 / 1e9, (needed_mid_bytes + att_bytes) as f64 / 1e9);
             let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;

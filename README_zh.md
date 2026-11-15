@@ -183,6 +183,10 @@
 
 ## 仓库分支架构与演进史
 
+> [!NOTE]
+> 分支演进与详细架构复盘：[docs/BRANCH_PROGRESS_zh.md](docs/BRANCH_PROGRESS_zh.md)
+
+
 为保障工程主干高可用并支撑激进探索，本仓库设立了清晰的分支演进矩阵：
 
 ```

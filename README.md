@@ -191,6 +191,10 @@ All generated latents have been strictly verified against golden FP32 baselines 
 
 ## Repository Branch Architecture & Evolution
 
+> [!NOTE]
+> Detailed Branch Deep-Dive: [docs/BRANCH_PROGRESS.md](docs/BRANCH_PROGRESS.md)
+
+
 To maintain codebase hygiene while exploring radical architectural breakthroughs, the repository maintains specialized branches:
 
 ```
