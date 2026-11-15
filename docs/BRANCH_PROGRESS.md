@@ -105,13 +105,13 @@ For sequence lengths exceeding 85k tokens, `main` orchestrates strict staggered 
 
 All milestones have been verified on an **NVIDIA GeForce RTX 3070 Laptop (80W, 8GB VRAM)**:
 
-| Metric | 1080p 3s | 1080p 5s | 1080p 8s | 1080p 12s |
-|---|---|---|---|---|
-| **Sequence Length ($S$)** | 49,273 tokens | 80,015 tokens | 121,041 tokens | 182,581 tokens |
-| **Baseline Latency** | 363.50 s | 592.80 s | 910.15 s | 1436.00 s |
-| **Phase 3 Latency** | **137.06 s** | **300.60 s** | **626.38 s** | **1467.30 s** |
-| **Speedup Ratio** | **2.65x** | **1.97x** | **1.45x** | **1.00x** (OOM Conquered) |
-| **Physical Norm Error** | < 0.002% | < 0.002% | 0.003% | 0.003% |
+| Metric | 1080p 3s | 1080p 5s | 1080p 8s | 1080p 12s (Phase 3.2b 80W) | 1080p 12s (Phase 3.3 125W) |
+|---|---|---|---|---|---|
+| **Sequence Length ($S$)** | 49,273 tokens | 80,015 tokens | 121,041 tokens | 182,581 tokens | 182,581 tokens |
+| **Baseline Latency** | 363.50 s | 592.80 s | 910.15 s | 1436.00 s | 1436.00 s |
+| **Phase 3 Latency** | **137.06 s** | **300.60 s** | **607.34 s** | **1376.29 s** | **1155.95 s** |
+| **Speedup Ratio** | **2.65x** | **1.97x** | **1.50x** | **1.06x** | **1.27x** (-311.35 s) |
+| **Physical Precision Verification** | < 0.002% | < 0.002% | 0.003% | **0.000% (L2=0.0)** | **0.000% (L2=0.0)** |
 
 ---
 

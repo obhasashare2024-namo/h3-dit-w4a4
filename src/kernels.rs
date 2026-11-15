@@ -970,6 +970,30 @@ extern "C" __global__ void copy_slice_col(void* dst, const void* src,
     }
 }
 
+
+extern "C" __global__ void gather_groups_to_rows(void* dst, const void* src,
+                                                unsigned long long N, unsigned long long G, unsigned long long W, int kind) {
+    unsigned long long row = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (row >= N) return;
+    unsigned long long g = blockIdx.y;
+    if (g >= G) return;
+
+    unsigned long long src_idx = (g * N + row) * W;
+    unsigned long long dst_idx = (row * G + g) * W;
+
+    if ((kind == 1 || kind == 2) && (W % 2 == 0)) {
+        const u32* src32 = (const u32*)((const u16*)src + src_idx);
+        u32* dst32 = (u32*)((u16*)dst + dst_idx);
+        unsigned long long num_u32 = W / 2;
+        for (unsigned long long i = 0; i < num_u32; i++) {
+            dst32[i] = src32[i];
+        }
+    } else {
+        for (unsigned long long i = 0; i < W; i++) {
+            stf(dst, kind, dst_idx + i, ldf(src, kind, src_idx + i));
+        }
+    }
+}
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -2129,5 +2153,80 @@ pub fn copy_slice_col_inplace(dst: &Tensor, src: &Tensor, col_offset: usize) -> 
             Ok(())
         }
         _ => candle_core::bail!("copy_slice_col: cuda only"),
+    }
+}
+
+
+pub fn gather_groups_to_rows_inplace(dst: &Tensor, src: &Tensor, g: usize, w: usize) -> Result<()> {
+    let (src_g, n, src_w) = src.dims3()?;
+    if src_g != g || src_w != w {
+        candle_core::bail!("gather_groups_to_rows: shape mismatch: src {:?} vs expected G={}, W={}", src.dims3()?, g, w);
+    }
+    let (dst_n, dst_total_w) = dst.dims2()?;
+    if dst_n != n || dst_total_w != g * w {
+        candle_core::bail!("gather_groups_to_rows: dst shape mismatch: dst {:?} vs expected [{}, {}]", dst.dims2()?, n, g * w);
+    }
+    let (st_dst, l_dst) = dst.storage_and_layout();
+    let (st_src, l_src) = src.storage_and_layout();
+    need_contig(l_dst, "gather dst")?;
+    need_contig(l_src, "gather src")?;
+    match (&*st_dst, &*st_src) {
+        (Storage::Cuda(cdst), Storage::Cuda(csrc)) => {
+            let dev = cdst.device().clone();
+            let func = dev.get_or_load_custom_func("gather_groups_to_rows", MODULE, ptx()?)?;
+            let dst_p = dev_ptr(cdst, l_dst)?;
+            let src_p = dev_ptr(csrc, l_src)?;
+            let k = kind_of(dst.dtype())?;
+            let mut b = func.builder();
+            let (nu, gu, wu) = (n as u64, g as u64, w as u64);
+            b.arg(&dst_p).arg(&src_p).arg(&nu).arg(&gu).arg(&wu).arg(&k);
+            let cfg = LaunchConfig {
+                grid_dim: (((n + 63) / 64) as u32, g as u32, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(cfg) }.w()?;
+            Ok(())
+        }
+        _ => candle_core::bail!("gather_groups_to_rows: cuda only"),
+    }
+}
+
+pub fn copy_tensor_to_host_pinned_async(t: &Tensor, dst_host: *mut u8) -> Result<()> {
+    let (st, l) = t.storage_and_layout();
+    match &*st {
+        Storage::Cuda(c) => {
+            let stream = c.device.cuda_stream().cu_stream();
+            let p = dev_ptr(c, l)?;
+            let bytes = t.elem_count() * t.dtype().size_in_bytes();
+            unsafe {
+                use candle_core::cuda_backend::cudarc::driver::sys;
+                let res = sys::cuMemcpyDtoHAsync_v2(dst_host as *mut std::ffi::c_void, p, bytes, stream);
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    candle_core::bail!("cuMemcpyDtoHAsync_v2 failed: {:?}", res);
+                }
+            }
+            Ok(())
+        }
+        _ => candle_core::bail!("needs cuda tensor"),
+    }
+}
+
+pub fn copy_host_pinned_to_tensor_offset_async(src_host: *const u8, t: &Tensor, dst_byte_offset: usize, bytes: usize) -> Result<()> {
+    let (st, l) = t.storage_and_layout();
+    match &*st {
+        Storage::Cuda(c) => {
+            let stream = c.device.cuda_stream().cu_stream();
+            let p = dev_ptr(c, l)? + dst_byte_offset as u64;
+            unsafe {
+                use candle_core::cuda_backend::cudarc::driver::sys;
+                let res = sys::cuMemcpyHtoDAsync_v2(p, src_host as *const std::ffi::c_void, bytes, stream);
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    candle_core::bail!("cuMemcpyHtoDAsync_v2 failed: {:?}", res);
+                }
+            }
+            Ok(())
+        }
+        _ => candle_core::bail!("needs cuda tensor"),
     }
 }

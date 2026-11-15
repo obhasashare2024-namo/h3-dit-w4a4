@@ -576,6 +576,12 @@ fn cpu_chunk_to_device(t: &Tensor, dev: &Device) -> Result<Tensor> {
     }
 }
 
+
+pub(crate) enum AttResult {
+    Gpu(Tensor),
+    Pinned(std::sync::Arc<crate::pinned_att::PinnedAttBuffer>),
+}
+
 impl Dit {
     pub fn load(path: &str, dev: &Device, mem: &MemoryConfig, lora: Option<(&Lora, f64)>) -> Result<Self> {
         let f = SafeFile::open(path)?;
@@ -1092,7 +1098,7 @@ impl Dit {
         }
     }
 
-    fn attend_grouped_qkv(&self, qkv: &QLinear, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<Tensor> {
+    fn attend_grouped_qkv(&self, qkv: &QLinear, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<AttResult> {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let inner = h * d;
         let (hg, w) = (h / groups, h / groups * d);
@@ -1103,13 +1109,19 @@ impl Dit {
         };
         let offload_att = s > 140000;
         println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, offload_att={}", s, groups, w, offload_att);
+        let pinned_att = if offload_att {
+            println!("[attend_grouped_qkv] Using Phase 3.2b-lite Pinned Host Attention Buffer (Zero CPU Cat)");
+            Some(crate::pinned_att::get_or_create_pinned_att(s, groups, w)?)
+        } else {
+            None
+        };
         let att_full = if !offload_att {
             println!("[attend_grouped_qkv] Preallocating att_full on GPU: [{}, {}]", s, inner);
             Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
         } else {
             None
         };
-        let mut outs = if offload_att { Vec::with_capacity(groups) } else { Vec::new() };
+        let mut outs = if offload_att && pinned_att.is_none() { Vec::with_capacity(groups) } else { Vec::new() };
         for g in 0..groups {
             println!("[attend_grouped_qkv] g={}: projecting q, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let qt = prof::time("qkv linear", &self.dev, || proj(0, g))?;
@@ -1145,6 +1157,9 @@ impl Dit {
             if let Some(ref full) = att_full {
                 kernels::copy_slice_col_inplace(full, &o, g * w)?;
                 drop(o);
+            } else if let Some(ref pbuf) = pinned_att {
+                prof::time("d2h pinned o", &self.dev, || pbuf.write_group_async(g, &o))?;
+                drop(o);
             } else {
                 outs.push(o.to_device(&Device::Cpu)?);
             }
@@ -1153,14 +1168,18 @@ impl Dit {
         drop(n1);
         if let Some(full) = att_full {
             println!("[attend_grouped_qkv] Zero-Copy Fastpath via Inplace Copy: returning full GPU tensor!");
-            Ok(full)
+            Ok(AttResult::Gpu(full))
+        } else if let Some(pbuf) = pinned_att {
+            println!("[attend_grouped_qkv] Phase 3.2b-lite: returning PinnedHost Attention Buffer!");
+            Ok(AttResult::Pinned(pbuf))
         } else if outs.len() == 1 {
             let o = outs.pop().unwrap();
-            if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
+            let o = if o.device().is_cuda() { o } else { o.to_device(&self.dev)? };
+            Ok(AttResult::Gpu(o))
         } else {
             let o_cpu = Tensor::cat(&outs, 1)?;
             drop(outs);
-            Ok(o_cpu)
+            Ok(AttResult::Gpu(o_cpu))
         }
     }
 
@@ -1380,7 +1399,7 @@ impl Dit {
             };
             (n1, None, x_h, dev)
         };
-        let att = match &b.qkv {
+        let att_res = match &b.qkv {
             QkvProj::Fused(qkv) if groups > 1 => {
                 let r_qkv = match &raws {
                     Some([r, ..]) => r.clone(),
@@ -1396,14 +1415,17 @@ impl Dit {
                 drop(n1);
                 let att = prof::time("attention", dev, || self.attend(&qkv_t, Some((&b.q_norm, &b.k_norm)), Some(cx.rope), rot, h, d))?;
                 drop(qkv_t);
-                att
+                AttResult::Gpu(att)
             }
             QkvProj::Factorized { q, k, v } => {
-                self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups)?
+                AttResult::Gpu(self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups)?)
             }
         };
 
-        let s = att.dim(0)?;
+        let s = match &att_res {
+            AttResult::Gpu(t) => t.dim(0)?,
+            AttResult::Pinned(p) => p.s,
+        };
         let mut x = if let Some(x_cpu) = x_saved {
             let (free_x, _) = crate::config::vram_info().unwrap_or((0, 0));
             println!("[dit] run_block: transferring x from CPU back to GPU, free VRAM={:.2} GB, required={:.2} GB", free_x as f64 / 1e9, (s * 5376 * 2) as f64 / 1e9);
@@ -1412,28 +1434,27 @@ impl Dit {
             x_holder.unwrap()
         };
 
-        if s > 30000 {
+        if let AttResult::Pinned(ref pbuf) = att_res {
             let (free_vram_out, _) = crate::config::vram_info().unwrap_or((0, 0));
-            println!("[out linear] start in-place: s={}, att device={:?}, free VRAM={:.2} GB", s, att.device(), free_vram_out as f64 / 1e9);
-            prof::time("out linear in-place", dev, || -> Result<()> {
+            println!("[out linear pinned] start Phase 3.2b-lite in-place: s={}, groups={}, w={}, free VRAM={:.2} GB", s, pbuf.groups, pbuf.w, free_vram_out as f64 / 1e9);
+            prof::time("out linear in-place pinned", dev, || -> Result<()> {
+                let staging = Tensor::zeros((pbuf.groups, chunk, pbuf.w), self.dtype, dev)?;
+                let gathered = Tensor::zeros((chunk, pbuf.groups * pbuf.w), self.dtype, dev)?;
                 match (&b.out, &raws) {
                     (LinProj::Single(out), Some([_, r_out, ..])) => {
                         let mut st = 0;
                         while st < s {
                             let n = chunk.min(s - st);
-                            println!("[out linear in-place] st={}, n={}, free VRAM={:.2} GB", st, n, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
-                            println!("[out linear in-place] step 1: narrow");
                             let chunk_x = x.narrow(0, st, n)?;
                             let chunk_idx = cx.idx.narrow(0, st, n)?;
-                            let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
-                            let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
-                            println!("[out linear in-place] step 3: forward_raw");
-                            let yc = out.forward_raw(&chunk_att, r_out, chunk)?;
-                            drop(chunk_att);
-                            println!("[out linear in-place] step 4: gate_add_inplace");
+                            let (stg, gth) = if n == chunk {
+                                (staging.clone(), gathered.clone())
+                            } else {
+                                (Tensor::zeros((pbuf.groups, n, pbuf.w), self.dtype, dev)?, Tensor::zeros((n, pbuf.groups * pbuf.w), self.dtype, dev)?)
+                            };
+                            pbuf.fetch_chunk_gathered(st, n, &stg, &gth)?;
+                            let yc = out.forward_raw(&gth, r_out, chunk)?;
                             kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
-                            drop(yc);
-                            println!("[out linear in-place] step 5: done chunk");
                             st += n;
                         }
                     }
@@ -1444,12 +1465,14 @@ impl Dit {
                             let n = chunk.min(s - st);
                             let chunk_x = x.narrow(0, st, n)?;
                             let chunk_idx = cx.idx.narrow(0, st, n)?;
-                            let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
-                            let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
-                            let yc = out.forward_raw(&chunk_att, &r_out, chunk)?;
-                            drop(chunk_att);
+                            let (stg, gth) = if n == chunk {
+                                (staging.clone(), gathered.clone())
+                            } else {
+                                (Tensor::zeros((pbuf.groups, n, pbuf.w), self.dtype, dev)?, Tensor::zeros((n, pbuf.groups * pbuf.w), self.dtype, dev)?)
+                            };
+                            pbuf.fetch_chunk_gathered(st, n, &stg, &gth)?;
+                            let yc = out.forward_raw(&gth, &r_out, chunk)?;
                             kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
-                            drop(yc);
                             st += n;
                         }
                     }
@@ -1459,42 +1482,107 @@ impl Dit {
                             let n = chunk.min(s - st);
                             let chunk_x = x.narrow(0, st, n)?;
                             let chunk_idx = cx.idx.narrow(0, st, n)?;
-                            let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
-                            let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
-                            let mid = lr.down.forward(&chunk_att)?;
-                            drop(chunk_att);
+                            let (stg, gth) = if n == chunk {
+                                (staging.clone(), gathered.clone())
+                            } else {
+                                (Tensor::zeros((pbuf.groups, n, pbuf.w), self.dtype, dev)?, Tensor::zeros((n, pbuf.groups * pbuf.w), self.dtype, dev)?)
+                            };
+                            pbuf.fetch_chunk_gathered(st, n, &stg, &gth)?;
+                            let mid = lr.down.forward(&gth)?;
                             let yc = lr.up.forward(&mid)?;
-                            drop(mid);
                             kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
-                            drop(yc);
                             st += n;
                         }
                     }
-                    _ => {
-                        let yc = b.out.forward(&att)?;
-                        kernels::gate_add_inplace(&x, &yc, &gate_msa, cx.idx)?;
-                    }
+                    _ => anyhow::bail!("unsupported out projection for pinned att"),
                 }
                 Ok(())
             })?;
-            drop(att);
-        } else {
-            let o = prof::time("out linear", dev, || match (&b.out, &raws) {
-                (LinProj::Single(out), Some([_, r_out, ..])) => out.forward_raw(&att, r_out, chunk),
-                (LinProj::Single(out), None) => {
-                    let r_out = out.fetch(dev)?;
-                    out.forward_raw(&att, &r_out, chunk)
-                }
-                (LinProj::Factorized(lr), _) => {
-                    let mid = lr.down.forward(&att)?;
-                    lr.up.forward(&mid)
-                }
-                _ => b.out.forward(&att),
-            })?;
-            drop(att);
-            let o = if o.device().is_cuda() { o } else { o.to_device(dev)? };
-            x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, cx.idx))?;
-            drop(o);
+        } else if let AttResult::Gpu(att) = att_res {
+            if s > 30000 {
+                let (free_vram_out, _) = crate::config::vram_info().unwrap_or((0, 0));
+                println!("[out linear] start in-place: s={}, att device={:?}, free VRAM={:.2} GB", s, att.device(), free_vram_out as f64 / 1e9);
+                prof::time("out linear in-place", dev, || -> Result<()> {
+                    match (&b.out, &raws) {
+                        (LinProj::Single(out), Some([_, r_out, ..])) => {
+                            let mut st = 0;
+                            while st < s {
+                                let n = chunk.min(s - st);
+                                println!("[out linear in-place] st={}, n={}, free VRAM={:.2} GB", st, n, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+                                println!("[out linear in-place] step 1: narrow");
+                                let chunk_x = x.narrow(0, st, n)?;
+                                let chunk_idx = cx.idx.narrow(0, st, n)?;
+                                let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
+                                let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
+                                println!("[out linear in-place] step 3: forward_raw");
+                                let yc = out.forward_raw(&chunk_att, r_out, chunk)?;
+                                drop(chunk_att);
+                                println!("[out linear in-place] step 4: gate_add_inplace");
+                                kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                                drop(yc);
+                                println!("[out linear in-place] step 5: done chunk");
+                                st += n;
+                            }
+                        }
+                        (LinProj::Single(out), None) => {
+                            let r_out = out.fetch(dev)?;
+                            let mut st = 0;
+                            while st < s {
+                                let n = chunk.min(s - st);
+                                let chunk_x = x.narrow(0, st, n)?;
+                                let chunk_idx = cx.idx.narrow(0, st, n)?;
+                                let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
+                                let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
+                                let yc = out.forward_raw(&chunk_att, &r_out, chunk)?;
+                                drop(chunk_att);
+                                kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                                drop(yc);
+                                st += n;
+                            }
+                        }
+                        (LinProj::Factorized(lr), _) => {
+                            let mut st = 0;
+                            while st < s {
+                                let n = chunk.min(s - st);
+                                let chunk_x = x.narrow(0, st, n)?;
+                                let chunk_idx = cx.idx.narrow(0, st, n)?;
+                                let chunk_att_raw = att.narrow(0, st, n)?.contiguous()?;
+                                let chunk_att = cpu_chunk_to_device(&chunk_att_raw, dev)?;
+                                let mid = lr.down.forward(&chunk_att)?;
+                                drop(chunk_att);
+                                let yc = lr.up.forward(&mid)?;
+                                drop(mid);
+                                kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                                drop(yc);
+                                st += n;
+                            }
+                        }
+                        _ => {
+                            let yc = b.out.forward(&att)?;
+                            kernels::gate_add_inplace(&x, &yc, &gate_msa, cx.idx)?;
+                        }
+                    }
+                    Ok(())
+                })?;
+                drop(att);
+            } else {
+                let o = prof::time("out linear", dev, || match (&b.out, &raws) {
+                    (LinProj::Single(out), Some([_, r_out, ..])) => out.forward_raw(&att, r_out, chunk),
+                    (LinProj::Single(out), None) => {
+                        let r_out = out.fetch(dev)?;
+                        out.forward_raw(&att, &r_out, chunk)
+                    }
+                    (LinProj::Factorized(lr), _) => {
+                        let mid = lr.down.forward(&att)?;
+                        lr.up.forward(&mid)
+                    }
+                    _ => b.out.forward(&att),
+                })?;
+                drop(att);
+                let o = if o.device().is_cuda() { o } else { o.to_device(dev)? };
+                x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, cx.idx))?;
+                drop(o);
+            }
         }
 
         let s = x.dim(0)?;

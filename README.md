@@ -177,8 +177,9 @@ For long sequences ($S > 85,000$), the engine enforces strict memory synchroniza
 |---|---|---|---|---|---|---|
 | **3 Seconds** | 49,273 tokens | 363.50 s | **137.06 s** | **2.65x** | -226.44 s | Pure GPU Zero-Copy Fastpath |
 | **5 Seconds** | 80,015 tokens | 592.80 s | **300.60 s** | **1.97x** | -292.20 s | Pure GPU In-Place Col-Copy |
-| **8 Seconds** | 121,041 tokens | 910.15 s | **626.38 s** | **1.45x** | -283.77 s | Adaptive 14-Group In-Place Col |
-| **12 Seconds** | 182,581 tokens | 1436.00 s | **1467.30 s** | **1.00x** | OOM Barrier Broken | Adaptive 28-Group Staggered |
+| **8 Seconds** | 121,041 tokens | 910.15 s | **607.34 s** | **1.50x** | -302.81 s | VRAM Threshold Refined (Pure Forward) |
+| **12s (80W)** | 182,581 tokens | 1436.00 s | **1376.29 s** | **1.06x** | -59.71 s | Phase 3.2b-lite Pinned Stream |
+| **12s (125W)** | 182,581 tokens | 1436.00 s | **1155.95 s** | **1.27x** | -311.35 s | Phase 3.3 Power/Clock Released |
 
 ### Numerical Rigor & Bit-Level Verification
 All generated latents have been strictly verified against golden FP32 baselines to eliminate silent numerical drift:
