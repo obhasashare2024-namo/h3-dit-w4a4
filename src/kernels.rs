@@ -956,6 +956,20 @@ void ampere_w4a4_group256_gemm_sm86(
         }
     }
 }
+
+extern "C" __global__ void copy_slice_col(void* dst, const void* src,
+                                         unsigned long long rows, unsigned long long dst_cols, unsigned long long src_cols,
+                                         unsigned long long col_offset, int kind) {
+    unsigned long long n = rows * src_cols;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long r = i / src_cols;
+        unsigned long long c = i % src_cols;
+        unsigned long long dst_idx = r * dst_cols + col_offset + c;
+        stf(dst, kind, dst_idx, ldf(src, kind, i));
+    }
+}
+
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -2085,5 +2099,35 @@ pub fn gemm_w4a4_preswizzled(
         y.broadcast_add(&b.to_dtype(x.dtype())?)
     } else {
         Ok(y)
+    }
+}
+
+
+pub fn copy_slice_col_inplace(dst: &Tensor, src: &Tensor, col_offset: usize) -> Result<()> {
+    let (s, src_c) = src.dims2()?;
+    let (dst_s, dst_c) = dst.dims2()?;
+    if s != dst_s {
+        candle_core::bail!("copy_slice_col_inplace: row mismatch: {} vs {}", s, dst_s);
+    }
+    let src_cast = src.to_dtype(dst.dtype())?.contiguous()?;
+    let (st_dst, l_dst) = dst.storage_and_layout();
+    let (st_src, l_src) = src_cast.storage_and_layout();
+    need_contig(l_dst, "copy_slice_col dst")?;
+    need_contig(l_src, "copy_slice_col src")?;
+    match (&*st_dst, &*st_src) {
+        (Storage::Cuda(cdst), Storage::Cuda(csrc)) => {
+            let dev = cdst.device().clone();
+            let func = dev.get_or_load_custom_func("copy_slice_col", MODULE, ptx()?)?;
+            let dst_p = dev_ptr(cdst, l_dst)?;
+            let src_p = dev_ptr(csrc, l_src)?;
+            let k = kind_of(dst.dtype())?;
+            let (su, dcu, scu, offu) = (s as u64, dst_c as u64, src_c as u64, col_offset as u64);
+            let mut b = func.builder();
+            b.arg(&dst_p).arg(&src_p).arg(&su).arg(&dcu).arg(&scu).arg(&offu).arg(&k);
+            let n = s * src_c;
+            unsafe { b.launch(grid_for(n)) }.w()?;
+            Ok(())
+        }
+        _ => candle_core::bail!("copy_slice_col: cuda only"),
     }
 }

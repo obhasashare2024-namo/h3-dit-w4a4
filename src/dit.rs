@@ -1014,10 +1014,18 @@ impl Dit {
             (mid_q, mid_k, mid_v)
         };
 
-        let offload_att = s > 50000;
+        let inner = h * d;
+        let offload_att = s > 130000;
         println!("[attend_factorized] offload_att={} (s={})", offload_att, s);
 
-        let mut outs = Vec::with_capacity(groups);
+        let att_full = if !offload_att {
+            println!("[attend_factorized] Preallocating att_full on GPU: [{}, {}]", s, inner);
+            Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
+        } else {
+            None
+        };
+
+        let mut outs = if offload_att { Vec::with_capacity(groups) } else { Vec::new() };
         for g in 0..groups {
             let r0 = g * w;
             let q_up = q.up.rows(r0, w, &self.dev)?;
@@ -1050,19 +1058,21 @@ impl Dit {
                 let o = ops::attention(&q_norm.unsqueeze(0)?, &k_norm.unsqueeze(0)?, &v_res.unsqueeze(0)?, false)?;
                 Ok(o.reshape((s, w))?)
             })?;
-            if offload_att {
-                outs.push(o.to_device(&Device::Cpu)?);
+            drop((q_norm, k_norm, vt));
+            if let Some(ref full) = att_full {
+                kernels::copy_slice_col_inplace(full, &o, g * w)?;
+                drop(o);
             } else {
-                outs.push(o);
+                outs.push(o.to_device(&Device::Cpu)?);
             }
         }
         drop((mid_q, mid_k, mid_v));
-        if outs.len() == 1 {
+        if let Some(full) = att_full {
+            println!("[attend_factorized] Zero-Copy Fastpath via Inplace Copy: returning full GPU tensor!");
+            Ok(full)
+        } else if outs.len() == 1 {
             let o = outs.pop().unwrap();
             if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
-        } else if !offload_att {
-            println!("[attend_factorized] Zero-Copy Fastpath: catting outs directly on GPU!");
-            Ok(Tensor::cat(&outs, 1)?)
         } else {
             let o_cpu = Tensor::cat(&outs, 1)?;
             drop(outs);
@@ -1079,9 +1089,15 @@ impl Dit {
             let r0 = base + g * w;
             qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
         };
-        let offload_att = s > 50000;
+        let offload_att = s > 130000;
         println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, offload_att={}", s, groups, w, offload_att);
-        let mut outs = Vec::with_capacity(groups);
+        let att_full = if !offload_att {
+            println!("[attend_grouped_qkv] Preallocating att_full on GPU: [{}, {}]", s, inner);
+            Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
+        } else {
+            None
+        };
+        let mut outs = if offload_att { Vec::with_capacity(groups) } else { Vec::new() };
         for g in 0..groups {
             println!("[attend_grouped_qkv] g={}: projecting q, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let qt = prof::time("qkv linear", &self.dev, || proj(0, g))?;
@@ -1114,20 +1130,21 @@ impl Dit {
                 Ok(o.reshape((s, w))?)
             })?;
             drop((q, k, vt));
-            if offload_att {
-                outs.push(o.to_device(&Device::Cpu)?);
+            if let Some(ref full) = att_full {
+                kernels::copy_slice_col_inplace(full, &o, g * w)?;
+                drop(o);
             } else {
-                outs.push(o);
+                outs.push(o.to_device(&Device::Cpu)?);
             }
         }
         println!("[attend_grouped_qkv] loop finished, dropping n1...");
         drop(n1);
-        if outs.len() == 1 {
+        if let Some(full) = att_full {
+            println!("[attend_grouped_qkv] Zero-Copy Fastpath via Inplace Copy: returning full GPU tensor!");
+            Ok(full)
+        } else if outs.len() == 1 {
             let o = outs.pop().unwrap();
             if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
-        } else if !offload_att {
-            println!("[attend_grouped_qkv] Zero-Copy Fastpath: catting outs directly on GPU!");
-            Ok(Tensor::cat(&outs, 1)?)
         } else {
             let o_cpu = Tensor::cat(&outs, 1)?;
             drop(outs);
