@@ -992,24 +992,30 @@ impl Dit {
         let chunk = self.mem.token_chunk.max(1);
         println!("[attend_factorized] start: s={}, groups={}, w={}, chunk={}, free VRAM={:.2} GB", s, groups, w, chunk, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
 
-        let (mid_q, mid_k, mid_v) = if s > 30000 {
+        let needed_mid_bytes = 3 * s * 768 * 2;
+        let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
+        let offload_mid = s > 30000 && free_vram_start < needed_mid_bytes + 1_500_000_000;
+        let (mid_q, mid_k, mid_v) = if offload_mid {
+            println!("[attend_factorized] offloading mid_q/k/v to CPU, free VRAM={:.2} GB", free_vram_start as f64 / 1e9);
             let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
             let mid_k_cpu = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
             let mid_v_cpu = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
             drop(n1);
-            println!("[attend_factorized] down projections done on CPU, n1 dropped, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let mid_q = mid_q_cpu.to_device(&self.dev)?;
             let mid_k = mid_k_cpu.to_device(&self.dev)?;
             let mid_v = mid_v_cpu.to_device(&self.dev)?;
-            println!("[attend_factorized] mid_q/k/v reloaded to GPU, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             (mid_q, mid_k, mid_v)
         } else {
+            println!("[attend_factorized] KEEPING mid_q/k/v ON GPU (Zero-Copy Fastpath), free VRAM={:.2} GB", free_vram_start as f64 / 1e9);
             let mid_q = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?;
             let mid_k = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?;
             let mid_v = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?;
             drop(n1);
             (mid_q, mid_k, mid_v)
         };
+
+        let offload_att = s > 50000;
+        println!("[attend_factorized] offload_att={} (s={})", offload_att, s);
 
         let mut outs = Vec::with_capacity(groups);
         for g in 0..groups {
@@ -1044,7 +1050,7 @@ impl Dit {
                 let o = ops::attention(&q_norm.unsqueeze(0)?, &k_norm.unsqueeze(0)?, &v_res.unsqueeze(0)?, false)?;
                 Ok(o.reshape((s, w))?)
             })?;
-            if s > 30000 && groups > 1 {
+            if offload_att {
                 outs.push(o.to_device(&Device::Cpu)?);
             } else {
                 outs.push(o);
@@ -1054,16 +1060,13 @@ impl Dit {
         if outs.len() == 1 {
             let o = outs.pop().unwrap();
             if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
-        } else if s > 30000 {
+        } else if !offload_att {
+            println!("[attend_factorized] Zero-Copy Fastpath: catting outs directly on GPU!");
+            Ok(Tensor::cat(&outs, 1)?)
+        } else {
             let o_cpu = Tensor::cat(&outs, 1)?;
             drop(outs);
             Ok(o_cpu)
-        } else {
-            let mut outs_dev = Vec::with_capacity(outs.len());
-            for t in outs {
-                outs_dev.push(if t.device().is_cuda() { t } else { t.to_device(&self.dev)? });
-            }
-            Ok(Tensor::cat(&outs_dev, 1)?)
         }
     }
 
@@ -1076,7 +1079,8 @@ impl Dit {
             let r0 = base + g * w;
             qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
         };
-        println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, free VRAM={:.2} GB", s, groups, w, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+        let offload_att = s > 50000;
+        println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, offload_att={}", s, groups, w, offload_att);
         let mut outs = Vec::with_capacity(groups);
         for g in 0..groups {
             println!("[attend_grouped_qkv] g={}: projecting q, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
@@ -1110,7 +1114,7 @@ impl Dit {
                 Ok(o.reshape((s, w))?)
             })?;
             drop((q, k, vt));
-            if s > 30000 && groups > 1 {
+            if offload_att {
                 outs.push(o.to_device(&Device::Cpu)?);
             } else {
                 outs.push(o);
@@ -1118,20 +1122,16 @@ impl Dit {
         }
         println!("[attend_grouped_qkv] loop finished, dropping n1...");
         drop(n1);
-        println!("[attend_grouped_qkv] catting outs (len={})...", outs.len());
         if outs.len() == 1 {
             let o = outs.pop().unwrap();
             if o.device().is_cuda() { Ok(o) } else { Ok(o.to_device(&self.dev)?) }
-        } else if s > 30000 {
+        } else if !offload_att {
+            println!("[attend_grouped_qkv] Zero-Copy Fastpath: catting outs directly on GPU!");
+            Ok(Tensor::cat(&outs, 1)?)
+        } else {
             let o_cpu = Tensor::cat(&outs, 1)?;
             drop(outs);
             Ok(o_cpu)
-        } else {
-            let mut outs_dev = Vec::with_capacity(outs.len());
-            for t in outs {
-                outs_dev.push(if t.device().is_cuda() { t } else { t.to_device(&self.dev)? });
-            }
-            Ok(Tensor::cat(&outs_dev, 1)?)
         }
     }
 

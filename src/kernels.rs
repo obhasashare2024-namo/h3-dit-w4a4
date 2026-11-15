@@ -1402,7 +1402,7 @@ impl CustomOp2 for Modulate {
     }
 }
 
-fn cuda_ptr_of(t: &Tensor) -> Result<u64> {
+pub fn cuda_ptr_of(t: &Tensor) -> Result<u64> {
     let (st, l) = t.storage_and_layout();
     match &*st {
         Storage::Cuda(c) => {
