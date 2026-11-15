@@ -1317,17 +1317,26 @@ impl Dit {
         let groups = match &b.qkv {
             QkvProj::Fused(qkv) => self.attn_groups(x.dim(0)?, qkv),
             QkvProj::Factorized { .. } => {
-                let tokens = x.dim(0)?;
-                let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
-                let budget: usize = std::env::var("H3_ATTN_BUDGET")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(800_000_000);
-                if qkv_bytes <= budget {
-                    1
+                if let Some(g) = std::env::var("H3_ATTN_GROUPS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    if g >= 1 && self.cfg.heads % g == 0 {
+                        g
+                    } else {
+                        self.cfg.heads
+                    }
                 } else {
-                    let want = qkv_bytes.div_ceil(budget);
-                    (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads)
+                    let tokens = x.dim(0)?;
+                    let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
+                    let budget: usize = std::env::var("H3_ATTN_BUDGET")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(800_000_000);
+                    if qkv_bytes <= budget {
+                        1
+                    } else {
+                        let want = qkv_bytes.div_ceil(budget);
+                        let res = (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads);
+                        res
+                    }
                 }
             }
         };
