@@ -1383,7 +1383,7 @@ impl QLinear {
             QFormat::AmpereW4A4Preswizzled { .. } if dev.is_cuda() => Prepared::W4A4(raw),
             QFormat::AmpereW4A8Preswizzled { .. } if dev.is_cuda() => Prepared::Int8(raw),
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
-            QFormat::GgufQuant { gtype: GgmlType::Q3K | GgmlType::Q5K } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
+            QFormat::GgufQuant { gtype: GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
                 Prepared::Mmq(raw)
             }
             QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
@@ -1482,21 +1482,29 @@ impl QLinear {
 
         let chunk = if chunk == 0 { 1024 } else { chunk.min(1024) };
         let dev = x.device();
-        let is_q5k = matches!(self.fmt, QFormat::GgufQuant { gtype: GgmlType::Q5K });
+        let _is_q5k = matches!(self.fmt, QFormat::GgufQuant { gtype: GgmlType::Q5K });
 
         let mut outs = Vec::new();
         let mut start = 0;
         while start < rows {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
-            let yc = if is_q5k {
-                crate::dit::prof::time("  mmq_q5k gemm", dev, || {
-                    kernels::mmq_q5_k(&xc, &raw.w, self.out_features, self.in_features)
-                })?
-            } else {
-                crate::dit::prof::time("  mmq_q3k gemm", dev, || {
-                    kernels::mmq_q3_k(&xc, &raw.w, self.out_features, self.in_features)
-                })?
+            let yc = match self.fmt {
+                QFormat::GgufQuant { gtype: GgmlType::Q5K } => {
+                    crate::dit::prof::time("  mmq_q5k gemm", dev, || {
+                        kernels::mmq_q5_k(&xc, &raw.w, self.out_features, self.in_features)
+                    })?
+                }
+                QFormat::GgufQuant { gtype: GgmlType::Q4K } => {
+                    crate::dit::prof::time("  mmq_q4k gemm", dev, || {
+                        kernels::mmq_q4_k(&xc, &raw.w, self.out_features, self.in_features)
+                    })?
+                }
+                _ => {
+                    crate::dit::prof::time("  mmq_q3k gemm", dev, || {
+                        kernels::mmq_q3_k(&xc, &raw.w, self.out_features, self.in_features)
+                    })?
+                }
             };
             outs.push(yc);
             start += n;

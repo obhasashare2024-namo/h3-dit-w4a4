@@ -20,6 +20,11 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize) -> Result<()> 
         if bytes_per_block == 110 {
             raw[base + 108] = 0x66; raw[base + 109] = 0x2A;
             for s in 0..12 { raw[base + 96 + s] = (s as u8 * 17 + b as u8 * 7) ^ 0xAA; }
+        } else if bytes_per_block == 144 {
+            raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
+            raw[base + 2] = 0x11; raw[base + 3] = 0x22;
+            for s in 0..12 { raw[base + 4 + s] = (s as u8 * 13 + b as u8 * 5) ^ 0x55; }
+            for q in 0..128 { raw[base + 16 + q] = (q as u8 * 19) ^ 0x33; }
         } else if bytes_per_block == 176 {
             raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
             raw[base + 2] = 0x11; raw[base + 3] = 0x22;
@@ -101,12 +106,13 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize) -> Result<()> 
 
 fn main() -> Result<()> {
     println!("========================================================");
-    println!("  DEF-031: QLinear MMQ Q3_K & Q5_K Integration Test     ");
+    println!("  DEF-034: QLinear MMQ Q3_K, Q4_K, Q5_K Integration Test ");
     println!("========================================================");
 
     test_case("Q3_K", GgmlType::Q3K, 110)?;
+    test_case("Q4_K", GgmlType::Q4K, 144)?;
     test_case("Q5_K", GgmlType::Q5K, 176)?;
 
-    println!("\n🎉 ALL QLinear MMQ INTEGRATION TESTS PASSED!");
+    println!("\n🎉 ALL QLinear MMQ TRIO INTEGRATION TESTS PASSED!");
     Ok(())
 }
