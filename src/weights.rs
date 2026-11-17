@@ -1474,23 +1474,35 @@ impl QLinear {
     }
 
     
-    pub fn apply_mmq(&self, x: &Tensor, raw: &Raw, _chunk: usize) -> Result<Tensor> {
+    pub fn apply_mmq(&self, x: &Tensor, raw: &Raw, chunk: usize) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let k = *dims.last().unwrap();
         let rows = x.elem_count() / k;
         let x2 = x.reshape((rows, k))?;
 
+        let chunk = if chunk == 0 { 1024 } else { chunk.min(1024) };
         let dev = x.device();
         let is_q5k = matches!(self.fmt, QFormat::GgufQuant { gtype: GgmlType::Q5K });
-        let y = if is_q5k {
-            crate::dit::prof::time("  mmq_q5k gemm", dev, || {
-                kernels::mmq_q5_k(&x2, &raw.w, self.out_features, self.in_features)
-            })?
-        } else {
-            crate::dit::prof::time("  mmq_q3k gemm", dev, || {
-                kernels::mmq_q3_k(&x2, &raw.w, self.out_features, self.in_features)
-            })?
-        };
+
+        let mut outs = Vec::new();
+        let mut start = 0;
+        while start < rows {
+            let n = chunk.min(rows - start);
+            let xc = x2.narrow(0, start, n)?;
+            let yc = if is_q5k {
+                crate::dit::prof::time("  mmq_q5k gemm", dev, || {
+                    kernels::mmq_q5_k(&xc, &raw.w, self.out_features, self.in_features)
+                })?
+            } else {
+                crate::dit::prof::time("  mmq_q3k gemm", dev, || {
+                    kernels::mmq_q3_k(&xc, &raw.w, self.out_features, self.in_features)
+                })?
+            };
+            outs.push(yc);
+            start += n;
+        }
+
+        let y = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
 
         let y = match &self.bias {
             Some(b) => y.broadcast_add(&b.to_dtype(x.dtype())?)?,
