@@ -1510,6 +1510,49 @@ extern "C" __global__ void mmq_q6_k_direct(
     y[(size_t)m_idx * N + n_idx] = f2bf(acc);
 }
 
+
+extern "C" __global__ void mmq_q4_0_direct(
+    const u16* __restrict__ x,
+    const void* __restrict__ w_raw,
+    u16* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    int m_idx = blockIdx.y;
+    int n_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (m_idx >= M || n_idx >= N) return;
+
+    int num_blocks = K / QK4_0;
+    const block_q4_0* w_row = ((const block_q4_0*)w_raw) + (size_t)n_idx * num_blocks;
+    const u16* x_row = x + (size_t)m_idx * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < num_blocks; ++b) {
+        const block_q4_0* blk = &w_row[b];
+        float d = h2f(blk->d);
+        const u8* qs = blk->qs;
+        int k_base = b * QK4_0;
+
+        float sub_dot = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 16; ++l) {
+            u8 q = qs[l];
+            float w0 = (float)(q & 0xF) - 8.0f;
+            float w1 = (float)(q >> 4) - 8.0f;
+            float x0 = bf2f(x_row[k_base + l]);
+            float x1 = bf2f(x_row[k_base + 16 + l]);
+            sub_dot += x0 * w0 + x1 * w1;
+        }
+
+        acc += d * sub_dot;
+    }
+
+    y[(size_t)m_idx * N + n_idx] = f2bf(acc);
+}
+
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -2988,6 +3031,42 @@ pub fn mmq_q6_k(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: us
     let yp = tensor_dev_ptr(&y)?;
 
     let func = cuda_dev.get_or_load_custom_func("mmq_q6_k_direct", MODULE, ptx()?)?;
+    let (mi, ni, ki) = (m as i32, out_features as i32, in_features as i32);
+    let mut bld = func.builder();
+    bld.arg(&xp).arg(&wp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
+
+    let block_dim = 128u32;
+    let grid_x = (out_features as u32).div_ceil(block_dim);
+    let grid_y = m as u32;
+
+    unsafe {
+        bld.launch(LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }.w()?;
+
+    Ok(y)
+}
+
+pub fn mmq_q4_0(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: usize) -> Result<Tensor> {
+    let dev = x.device();
+    let cuda_dev = match dev {
+        candle_core::Device::Cuda(c) => c,
+        _ => candle_core::bail!("mmq_q4_0: raw tensor must be on CUDA device"),
+    };
+    let (m, k) = x.dims2()?;
+    if k != in_features {
+        candle_core::bail!("mmq_q4_0: in_features mismatch: expected {}, got {}", in_features, k);
+    }
+    let y = Tensor::zeros((m, out_features), DType::BF16, dev)?;
+
+    let xp = tensor_dev_ptr(x)?;
+    let wp = tensor_dev_ptr(raw_w)?;
+    let yp = tensor_dev_ptr(&y)?;
+
+    let func = cuda_dev.get_or_load_custom_func("mmq_q4_0_direct", MODULE, ptx()?)?;
     let (mi, ni, ki) = (m as i32, out_features as i32, in_features as i32);
     let mut bld = func.builder();
     bld.arg(&xp).arg(&wp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);

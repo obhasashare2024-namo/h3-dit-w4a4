@@ -38,6 +38,9 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: us
         } else if bytes_per_block == 34 {
             raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
             for q in 0..32 { raw[base + 2 + q] = ((q as u8 * 17 + b as u8 * 3) ^ 0x33) as u8; }
+        } else if bytes_per_block == 18 {
+            raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
+            for q in 0..16 { raw[base + 2 + q] = ((q as u8 * 17 + b as u8 * 3) ^ 0x33) as u8; }
         }
     }
     let raw_t = Tensor::from_vec(raw, (raw_bytes_len,), &dev)?;
@@ -114,7 +117,7 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: us
 
 fn main() -> Result<()> {
     println!("========================================================");
-    println!("  DEF-038: QLinear MMQ Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 Penta Test ");
+    println!("  DEF-040: QLinear MMQ Hexa Test (6 Formats Verification)");
     println!("========================================================");
 
     test_case("Q3_K", GgmlType::Q3K, 110, 256)?;
@@ -122,7 +125,8 @@ fn main() -> Result<()> {
     test_case("Q5_K", GgmlType::Q5K, 176, 256)?;
     test_case("Q6_K", GgmlType::Q6K, 210, 256)?;
     test_case("Q8_0", GgmlType::Q8_0, 34, 32)?;
+    test_case("Q4_0", GgmlType::Q4_0, 18, 32)?;
 
-    println!("\n🎉 ALL QLinear MMQ PENTA INTEGRATION TESTS PASSED 100%!");
+    println!("\n🎉 ALL QLinear MMQ HEXA INTEGRATION TESTS PASSED 100%!");
     Ok(())
 }
