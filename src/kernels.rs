@@ -1445,6 +1445,71 @@ extern "C" __global__ void mmq_q8_0_direct(
     y[(size_t)m_idx * N + n_idx] = f2bf(acc);
 }
 
+
+extern "C" __global__ void mmq_q6_k_direct(
+    const u16* __restrict__ x,
+    const void* __restrict__ w_raw,
+    u16* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    int m_idx = blockIdx.y;
+    int n_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (m_idx >= M || n_idx >= N) return;
+
+    int num_blocks = K / QK_K;
+    const block_q6_K* w_row = ((const block_q6_K*)w_raw) + (size_t)n_idx * num_blocks;
+    const u16* x_row = x + (size_t)m_idx * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < num_blocks; ++b) {
+        const block_q6_K* blk = &w_row[b];
+        float d = h2f(blk->d);
+
+        #pragma unroll
+        for (int ip = 0; ip < 2; ++ip) {
+            const u8* ql_base = blk->ql + 64 * ip;
+            const u8* qh_base = blk->qh + 32 * ip;
+            const signed char* sc_base = blk->scales + 8 * ip;
+            int k_half = b * QK_K + 128 * ip;
+
+            #pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                const signed char* sc = sc_base + sub;
+                float s0 = d * (float)sc[0];
+                float s2 = d * (float)sc[2];
+                float s4 = d * (float)sc[4];
+                float s6 = d * (float)sc[6];
+
+                #pragma unroll
+                for (int l = 0; l < 16; ++l) {
+                    int il = sub * 16 + l;
+                    u8 ql_0 = ql_base[il];
+                    u8 ql_32 = ql_base[32 + il];
+                    u8 qh = qh_base[il];
+
+                    float w0 = (float)((signed char)((ql_0 & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+                    float w1 = (float)((signed char)((ql_32 & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+                    float w2 = (float)((signed char)((ql_0 >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+                    float w3 = (float)((signed char)((ql_32 >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+
+                    float x0 = bf2f(x_row[k_half + il + 0]);
+                    float x1 = bf2f(x_row[k_half + il + 32]);
+                    float x2 = bf2f(x_row[k_half + il + 64]);
+                    float x3 = bf2f(x_row[k_half + il + 96]);
+
+                    acc += s0 * (w0 * x0) + s2 * (w1 * x1) + s4 * (w2 * x2) + s6 * (w3 * x3);
+                }
+            }
+        }
+    }
+
+    y[(size_t)m_idx * N + n_idx] = f2bf(acc);
+}
+
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -2905,3 +2970,39 @@ pub fn mmq_q8_0(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: us
 
 
 
+
+pub fn mmq_q6_k(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: usize) -> Result<Tensor> {
+    let dev = x.device();
+    let cuda_dev = match dev {
+        candle_core::Device::Cuda(c) => c,
+        _ => candle_core::bail!("mmq_q6_k: raw tensor must be on CUDA device"),
+    };
+    let (m, k) = x.dims2()?;
+    if k != in_features {
+        candle_core::bail!("mmq_q6_k: in_features mismatch: expected {}, got {}", in_features, k);
+    }
+    let y = Tensor::zeros((m, out_features), DType::BF16, dev)?;
+
+    let xp = tensor_dev_ptr(x)?;
+    let wp = tensor_dev_ptr(raw_w)?;
+    let yp = tensor_dev_ptr(&y)?;
+
+    let func = cuda_dev.get_or_load_custom_func("mmq_q6_k_direct", MODULE, ptx()?)?;
+    let (mi, ni, ki) = (m as i32, out_features as i32, in_features as i32);
+    let mut bld = func.builder();
+    bld.arg(&xp).arg(&wp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
+
+    let block_dim = 128u32;
+    let grid_x = (out_features as u32).div_ceil(block_dim);
+    let grid_y = m as u32;
+
+    unsafe {
+        bld.launch(LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }.w()?;
+
+    Ok(y)
+}

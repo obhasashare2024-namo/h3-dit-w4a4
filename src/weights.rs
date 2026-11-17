@@ -1383,7 +1383,7 @@ impl QLinear {
             QFormat::AmpereW4A4Preswizzled { .. } if dev.is_cuda() => Prepared::W4A4(raw),
             QFormat::AmpereW4A8Preswizzled { .. } if dev.is_cuda() => Prepared::Int8(raw),
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
-            QFormat::GgufQuant { gtype: GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q8_0 } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
+            QFormat::GgufQuant { gtype: GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
                 Prepared::Mmq(raw)
             }
             QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
@@ -1498,6 +1498,11 @@ impl QLinear {
                 QFormat::GgufQuant { gtype: GgmlType::Q4K } => {
                     crate::dit::prof::time("  mmq_q4k gemm", dev, || {
                         kernels::mmq_q4_k(&xc, &raw.w, self.out_features, self.in_features)
+                    })?
+                }
+                QFormat::GgufQuant { gtype: GgmlType::Q6K } => {
+                    crate::dit::prof::time("  mmq_q6k gemm", dev, || {
+                        kernels::mmq_q6_k(&xc, &raw.w, self.out_features, self.in_features)
                     })?
                 }
                 QFormat::GgufQuant { gtype: GgmlType::Q8_0 } => {
