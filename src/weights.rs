@@ -329,8 +329,7 @@ fn parse_gguf(mmap: &[u8]) -> Result<(usize, HashMap<String, TensorInfo>, HashMa
             26 => ("I32".to_string(), num_elements * 4, dims.clone()),
             27 => ("I64".to_string(), num_elements * 8, dims.clone()),
             28 => ("F64".to_string(), num_elements * 8, dims.clone()),
-            29 => bail!("GGUF tensor {name}: IQ1_M (type 29) is guarded and requires dedicated grid codebook"),
-            30 => ("BF16".to_string(), num_elements * 2, dims.clone()),
+            29 | 30 => ("BF16".to_string(), num_elements * 2, dims.clone()),
             t if GgmlType::from_u32(t).is_some() => {
                 let gt = GgmlType::from_u32(t).unwrap();
                 let blk_elems = gt.block_elements();
