@@ -46,6 +46,12 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: us
         } else if bytes_per_block == 18 {
             raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
             for q in 0..16 { raw[base + 2 + q] = ((q as u8 * 17 + b as u8 * 3) ^ 0x33) as u8; }
+        } else if bytes_per_block == 136 {
+            raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
+            raw[base + 2] = ((b * 7 + 0x55) & 0xFF) as u8;
+            raw[base + 3] = ((b * 11 + 0xAA) & 0xFF) as u8;
+            for s in 0..4 { raw[base + 4 + s] = (((s as u8 * 17) ^ 0x33) & 0xFF) as u8; }
+            for q in 0..128 { raw[base + 8 + q] = (((q as u8 * 29) ^ 0x9B) & 0xFF) as u8; }
         }
     }
     let raw_t = Tensor::from_vec(raw, (raw_bytes_len,), &dev)?;
@@ -122,7 +128,7 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: us
 
 fn main() -> Result<()> {
     println!("========================================================");
-    println!("  DEF-042: QLinear MMQ Hepta Test (7 Formats Verification)");
+    println!("  DEF-044: QLinear MMQ Octa Test (8 Formats Verification)");
     println!("========================================================");
 
     test_case("Q2_K", GgmlType::Q2K, 84, 256)?;
@@ -132,7 +138,8 @@ fn main() -> Result<()> {
     test_case("Q6_K", GgmlType::Q6K, 210, 256)?;
     test_case("Q8_0", GgmlType::Q8_0, 34, 32)?;
     test_case("Q4_0", GgmlType::Q4_0, 18, 32)?;
+    test_case("IQ4_XS", GgmlType::IQ4XS, 136, 256)?;
 
-    println!("\n🎉 ALL QLinear MMQ HEPTA INTEGRATION TESTS PASSED 100%!");
+    println!("\n🎉 ALL QLinear MMQ OCTA INTEGRATION TESTS PASSED 100%!");
     Ok(())
 }

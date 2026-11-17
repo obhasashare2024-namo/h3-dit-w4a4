@@ -1623,6 +1623,102 @@ extern "C" __global__ void mmq_q2_k_direct(
     y[(size_t)m_idx * N + n_idx] = f2bf(acc);
 }
 
+
+typedef signed char i8;
+
+#pragma pack(push, 1)
+typedef struct {
+    u16 d;
+    u16 scales_h;
+    u8  scales_l[4];
+    u8  qs[128];
+} block_iq4_xs;
+#pragma pack(pop)
+
+__constant__ i8 kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
+extern "C" __global__ void dequant_gguf_iq4_xs(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_iq4_xs* x = reinterpret_cast<const block_iq4_xs*>(vx);
+    const int tid = threadIdx.x;
+    if (tid >= 128) return;
+
+    const float d = h2f(x[i].d);
+    const u16 scales_h = x[i].scales_h;
+    const u8* scales_l = x[i].scales_l;
+
+    int ib = tid / 16;
+    int j = tid % 16;
+
+    int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+    float dl = d * (float)(ls - 32);
+
+    u8 q = x[i].qs[tid];
+    float v0 = dl * (float)kvalues_iq4nl[q & 0xF];
+    float v1 = dl * (float)kvalues_iq4nl[q >> 4];
+
+    size_t base = i * QK_K + 32 * ib;
+    stf(yy, kind, base + j, v0);
+    stf(yy, kind, base + 16 + j, v1);
+}
+
+extern "C" __global__ void mmq_iq4_xs_direct(
+    const u16* __restrict__ x,
+    const void* __restrict__ w_raw,
+    u16* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    int m_idx = blockIdx.y;
+    int n_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (m_idx >= M || n_idx >= N) return;
+
+    int num_blocks = K / QK_K;
+    const block_iq4_xs* w_row = ((const block_iq4_xs*)w_raw) + (size_t)n_idx * num_blocks;
+    const u16* x_row = x + (size_t)m_idx * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < num_blocks; ++b) {
+        const block_iq4_xs* blk = &w_row[b];
+        float d = h2f(blk->d);
+        u16 scales_h = blk->scales_h;
+        const u8* scales_l = blk->scales_l;
+        const u8* qs = blk->qs;
+
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+            float dl = d * (float)(ls - 32);
+
+            int k_base = b * QK_K + 32 * ib;
+            const u8* sub_qs = qs + 16 * ib;
+
+            float sub_dot = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                u8 q = sub_qs[j];
+                float v0 = (float)kvalues_iq4nl[q & 0xF];
+                float v1 = (float)kvalues_iq4nl[q >> 4];
+
+                float x0 = bf2f(x_row[k_base + j]);
+                float x1 = bf2f(x_row[k_base + 16 + j]);
+
+                sub_dot += x0 * v0 + x1 * v1;
+            }
+
+            acc += dl * sub_dot;
+        }
+    }
+
+    y[(size_t)m_idx * N + n_idx] = f2bf(acc);
+}
+
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -2912,6 +3008,7 @@ pub fn dequant_gguf(raw_u8: &Tensor, gtype: crate::weights::GgmlType, out_featur
         GgmlType::Q4K  => ("dequant_gguf_q4_k",  32u32),
         GgmlType::Q5K  => ("dequant_gguf_q5_k",  64u32),
         GgmlType::Q6K  => ("dequant_gguf_q6_k",  64u32),
+        GgmlType::IQ4XS => ("dequant_gguf_iq4_xs", 128u32),
         _ => candle_core::bail!("dequant_gguf: unsupported or guarded type {:?}", gtype),
     };
 
@@ -3173,6 +3270,42 @@ pub fn mmq_q2_k(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: us
     let yp = tensor_dev_ptr(&y)?;
 
     let func = cuda_dev.get_or_load_custom_func("mmq_q2_k_direct", MODULE, ptx()?)?;
+    let (mi, ni, ki) = (m as i32, out_features as i32, in_features as i32);
+    let mut bld = func.builder();
+    bld.arg(&xp).arg(&wp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
+
+    let block_dim = 128u32;
+    let grid_x = (out_features as u32).div_ceil(block_dim);
+    let grid_y = m as u32;
+
+    unsafe {
+        bld.launch(LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }.w()?;
+
+    Ok(y)
+}
+
+pub fn mmq_iq4_xs(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: usize) -> Result<Tensor> {
+    let dev = x.device();
+    let cuda_dev = match dev {
+        candle_core::Device::Cuda(c) => c,
+        _ => candle_core::bail!("mmq_iq4_xs: raw tensor must be on CUDA device"),
+    };
+    let (m, k) = x.dims2()?;
+    if k != in_features {
+        candle_core::bail!("mmq_iq4_xs: in_features mismatch: expected {}, got {}", in_features, k);
+    }
+    let y = Tensor::zeros((m, out_features), DType::BF16, dev)?;
+
+    let xp = tensor_dev_ptr(x)?;
+    let wp = tensor_dev_ptr(raw_w)?;
+    let yp = tensor_dev_ptr(&y)?;
+
+    let func = cuda_dev.get_or_load_custom_func("mmq_iq4_xs_direct", MODULE, ptx()?)?;
     let (mi, ni, ki) = (m as i32, out_features as i32, in_features as i32);
     let mut bld = func.builder();
     bld.arg(&xp).arg(&wp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
