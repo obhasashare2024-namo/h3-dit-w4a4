@@ -1278,6 +1278,71 @@ extern "C" __global__ void mmq_q3_k_direct(
     y[(size_t)m * N + n] = f2bf(acc);
 }
 
+extern "C" __global__ void mmq_q5_k_direct(
+    const u16* __restrict__ x,
+    const void* __restrict__ w_raw,
+    u16* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    int m_idx = blockIdx.y;
+    int n_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (m_idx >= M || n_idx >= N) return;
+
+    int num_blocks = K / QK_K;
+    const block_q5_K* w_row = ((const block_q5_K*)w_raw) + (size_t)n_idx * num_blocks;
+    const u16* x_row = x + (size_t)m_idx * K;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < num_blocks; ++b) {
+        const block_q5_K* blk = &w_row[b];
+        float dall = h2f(blk->d);
+        float dmin = h2f(blk->dmin);
+
+        #pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            int is = 2 * il;
+            u8 sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, blk->scales, sc1, m1);
+            get_scale_min_k4(is + 1, blk->scales, sc2, m2);
+
+            float d1 = dall * (float)sc1;
+            float min1 = dmin * (float)m1;
+            float d2 = dall * (float)sc2;
+            float min2 = dmin * (float)m2;
+
+            u8 hm1 = 1 << (2 * il);
+            u8 hm2 = hm1 << 1;
+
+            const u8* ql = blk->qs + 32 * il;
+            const u8* qh = blk->qh;
+
+            int k_base1 = b * QK_K + 64 * il;
+            int k_base2 = k_base1 + 32;
+
+            float dot1 = 0.0f;
+            float dot2 = 0.0f;
+
+            #pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                float w1 = (float)((ql[l] & 0xF) + ((qh[l] & hm1) ? 16 : 0));
+                float x1 = bf2f(x_row[k_base1 + l]);
+                dot1 += x1 * (d1 * w1 - min1);
+
+                float w2 = (float)((ql[l] >> 4) + ((qh[l] & hm2) ? 16 : 0));
+                float x2 = bf2f(x_row[k_base2 + l]);
+                dot2 += x2 * (d2 * w2 - min2);
+            }
+
+            acc += dot1 + dot2;
+        }
+    }
+
+    y[(size_t)m_idx * N + n_idx] = f2bf(acc);
+}
 
 "#;
 
@@ -2628,3 +2693,40 @@ pub fn mmq_q3_k(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: us
 
     Ok(y)
 }
+
+pub fn mmq_q5_k(x: &Tensor, raw_w: &Tensor, out_features: usize, in_features: usize) -> Result<Tensor> {
+    let dev = x.device();
+    let cuda_dev = match dev {
+        candle_core::Device::Cuda(c) => c,
+        _ => candle_core::bail!("mmq_q5_k: raw tensor must be on CUDA device"),
+    };
+    let (m, k) = x.dims2()?;
+    if k != in_features {
+        candle_core::bail!("mmq_q5_k: in_features mismatch: expected {}, got {}", in_features, k);
+    }
+    let y = Tensor::zeros((m, out_features), DType::BF16, dev)?;
+
+    let xp = tensor_dev_ptr(x)?;
+    let wp = tensor_dev_ptr(raw_w)?;
+    let yp = tensor_dev_ptr(&y)?;
+
+    let func = cuda_dev.get_or_load_custom_func("mmq_q5_k_direct", MODULE, ptx()?)?;
+    let (mi, ni, ki) = (m as i32, out_features as i32, in_features as i32);
+    let mut bld = func.builder();
+    bld.arg(&xp).arg(&wp).arg(&yp).arg(&mi).arg(&ni).arg(&ki);
+
+    let block_dim = 128u32;
+    let grid_x = (out_features as u32).div_ceil(block_dim);
+    let grid_y = m as u32;
+
+    unsafe {
+        bld.launch(LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }.w()?;
+
+    Ok(y)
+}
+

@@ -1383,7 +1383,7 @@ impl QLinear {
             QFormat::AmpereW4A4Preswizzled { .. } if dev.is_cuda() => Prepared::W4A4(raw),
             QFormat::AmpereW4A8Preswizzled { .. } if dev.is_cuda() => Prepared::Int8(raw),
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
-            QFormat::GgufQuant { gtype: GgmlType::Q3K } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
+            QFormat::GgufQuant { gtype: GgmlType::Q3K | GgmlType::Q5K } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
                 Prepared::Mmq(raw)
             }
             QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
@@ -1481,9 +1481,16 @@ impl QLinear {
         let x2 = x.reshape((rows, k))?;
 
         let dev = x.device();
-        let y = crate::dit::prof::time("  mmq_q3k gemm", dev, || {
-            kernels::mmq_q3_k(&x2, &raw.w, self.out_features, self.in_features)
-        })?;
+        let is_q5k = matches!(self.fmt, QFormat::GgufQuant { gtype: GgmlType::Q5K });
+        let y = if is_q5k {
+            crate::dit::prof::time("  mmq_q5k gemm", dev, || {
+                kernels::mmq_q5_k(&x2, &raw.w, self.out_features, self.in_features)
+            })?
+        } else {
+            crate::dit::prof::time("  mmq_q3k gemm", dev, || {
+                kernels::mmq_q3_k(&x2, &raw.w, self.out_features, self.in_features)
+            })?
+        };
 
         let y = match &self.bias {
             Some(b) => y.broadcast_add(&b.to_dtype(x.dtype())?)?,
