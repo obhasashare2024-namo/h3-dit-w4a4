@@ -17,7 +17,12 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: us
     let mut raw = vec![0x55u8; raw_bytes_len];
     for b in 0..num_blocks {
         let base = b * bytes_per_block;
-        if bytes_per_block == 110 {
+        if bytes_per_block == 84 {
+            for s in 0..16 { raw[base + s] = (((s as u8 * 13) ^ 0x67) & 0xFF) as u8; }
+            for q in 0..64 { raw[base + 16 + q] = (((q as u8 * 23) ^ 0x9A) & 0xFF) as u8; }
+            raw[base + 80] = 0x66; raw[base + 81] = 0x2A;
+            raw[base + 82] = 0x1E; raw[base + 83] = 0x21;
+        } else if bytes_per_block == 110 {
             raw[base + 108] = 0x66; raw[base + 109] = 0x2A;
             for s in 0..12 { raw[base + 96 + s] = (s as u8 * 17 + b as u8 * 7) ^ 0xAA; }
         } else if bytes_per_block == 144 {
@@ -117,9 +122,10 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: us
 
 fn main() -> Result<()> {
     println!("========================================================");
-    println!("  DEF-040: QLinear MMQ Hexa Test (6 Formats Verification)");
+    println!("  DEF-042: QLinear MMQ Hepta Test (7 Formats Verification)");
     println!("========================================================");
 
+    test_case("Q2_K", GgmlType::Q2K, 84, 256)?;
     test_case("Q3_K", GgmlType::Q3K, 110, 256)?;
     test_case("Q4_K", GgmlType::Q4K, 144, 256)?;
     test_case("Q5_K", GgmlType::Q5K, 176, 256)?;
@@ -127,6 +133,6 @@ fn main() -> Result<()> {
     test_case("Q8_0", GgmlType::Q8_0, 34, 32)?;
     test_case("Q4_0", GgmlType::Q4_0, 18, 32)?;
 
-    println!("\n🎉 ALL QLinear MMQ HEXA INTEGRATION TESTS PASSED 100%!");
+    println!("\n🎉 ALL QLinear MMQ HEPTA INTEGRATION TESTS PASSED 100%!");
     Ok(())
 }
