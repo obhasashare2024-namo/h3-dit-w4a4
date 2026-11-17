@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use h3_rs::weights::{GgmlType, Held, QFormat, QLinear, Raw};
 
-fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize) -> Result<()> {
+fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize, block_size: usize) -> Result<()> {
     println!("\n--------------------------------------------------------");
     println!("  Testing QLinear MMQ Integration: {:?} ({})", gtype, name);
     println!("--------------------------------------------------------");
@@ -12,7 +12,7 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize) -> Result<()> 
     let out_features = 256usize;
     let m = 16usize;
 
-    let num_blocks = (out_features * in_features) / 256;
+    let num_blocks = (out_features * in_features) / block_size;
     let raw_bytes_len = num_blocks * bytes_per_block;
     let mut raw = vec![0x55u8; raw_bytes_len];
     for b in 0..num_blocks {
@@ -30,6 +30,9 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize) -> Result<()> 
             raw[base + 2] = 0x11; raw[base + 3] = 0x22;
             for s in 0..12 { raw[base + 4 + s] = (s as u8 * 13 + b as u8 * 5) ^ 0x55; }
             for q in 0..32 { raw[base + 16 + q] = (q as u8 * 19) ^ 0x33; }
+        } else if bytes_per_block == 34 {
+            raw[base + 0] = 0x66; raw[base + 1] = 0x2A;
+            for q in 0..32 { raw[base + 2 + q] = ((q as u8 * 17 + b as u8 * 3) ^ 0x33) as u8; }
         }
     }
     let raw_t = Tensor::from_vec(raw, (raw_bytes_len,), &dev)?;
@@ -106,13 +109,14 @@ fn test_case(name: &str, gtype: GgmlType, bytes_per_block: usize) -> Result<()> 
 
 fn main() -> Result<()> {
     println!("========================================================");
-    println!("  DEF-034: QLinear MMQ Q3_K, Q4_K, Q5_K Integration Test ");
+    println!("  DEF-036: QLinear MMQ Q3_K, Q4_K, Q5_K, Q8_0 Quad Test ");
     println!("========================================================");
 
-    test_case("Q3_K", GgmlType::Q3K, 110)?;
-    test_case("Q4_K", GgmlType::Q4K, 144)?;
-    test_case("Q5_K", GgmlType::Q5K, 176)?;
+    test_case("Q3_K", GgmlType::Q3K, 110, 256)?;
+    test_case("Q4_K", GgmlType::Q4K, 144, 256)?;
+    test_case("Q5_K", GgmlType::Q5K, 176, 256)?;
+    test_case("Q8_0", GgmlType::Q8_0, 34, 32)?;
 
-    println!("\n🎉 ALL QLinear MMQ TRIO INTEGRATION TESTS PASSED!");
+    println!("\n🎉 ALL QLinear MMQ QUAD INTEGRATION TESTS PASSED 100%!");
     Ok(())
 }
