@@ -33,7 +33,8 @@ __device__ __forceinline__ float ldf(const void* p, int kind, size_t i) {
 __device__ __forceinline__ void stf(void* p, int kind, size_t i, float v) {
     if (kind == 0) ((float*)p)[i] = v;
     else if (kind == 1) ((u16*)p)[i] = f2h(v);
-    else ((u16*)p)[i] = f2bf(v);
+    else if (kind == 2) ((u16*)p)[i] = f2bf(v);
+    else ((signed char*)p)[i] = (signed char)__float2int_rn(fmaxf(-128.0f, fminf(127.0f, v)));
 }
 
 // int8 rows * (per-row or scalar) f32 scale -> out
@@ -994,6 +995,222 @@ extern "C" __global__ void gather_groups_to_rows(void* dst, const void* src,
         }
     }
 }
+
+// ==================== 9004 GGUF K-Quants Dequant Kernels ====================
+#define QK_K 256
+#define QK4_0 32
+#define QK8_0 32
+
+#pragma pack(push, 1)
+struct block_q4_0 {
+    u16 d;
+    u8  qs[QK4_0 / 2];
+};
+
+struct block_q8_0 {
+    u16 d;
+    signed char qs[QK8_0];
+};
+
+struct block_q2_K {
+    u8  scales[QK_K / 16];
+    u8  qs[QK_K / 4];
+    u16 d;
+    u16 dmin;
+};
+
+struct block_q3_K {
+    u8  hmask[QK_K / 8];
+    u8  qs[QK_K / 4];
+    u8  scales[12];
+    u16 d;
+};
+
+struct block_q4_K {
+    u16 d;
+    u16 dmin;
+    u8  scales[12];
+    u8  qs[QK_K / 2];
+};
+
+struct block_q5_K {
+    u16 d;
+    u16 dmin;
+    u8  scales[12];
+    u8  qh[QK_K / 8];
+    u8  qs[QK_K / 2];
+};
+
+struct block_q6_K {
+    u8  ql[QK_K / 2];
+    u8  qh[QK_K / 4];
+    signed char scales[QK_K / 16];
+    u16 d;
+};
+#pragma pack(pop)
+
+__device__ __forceinline__ void get_scale_min_k4(int j, const u8* q, u8& d, u8& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void dequant_gguf_q4_0(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q4_0* x = reinterpret_cast<const block_q4_0*>(vx);
+    const int tid = threadIdx.x;
+    if (tid >= 16) return;
+    const float d = h2f(x[i].d);
+    const u8 q = x[i].qs[tid];
+    const size_t base = i * QK4_0;
+    stf(yy, kind, base + tid,      d * ((float)(q & 0xF) - 8.0f));
+    stf(yy, kind, base + tid + 16, d * ((float)(q >>  4) - 8.0f));
+}
+
+extern "C" __global__ void dequant_gguf_q8_0(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q8_0* x = reinterpret_cast<const block_q8_0*>(vx);
+    const int tid = threadIdx.x;
+    const float d = h2f(x[i].d);
+    stf(yy, kind, i * QK8_0 + tid, d * (float)x[i].qs[tid]);
+}
+
+extern "C" __global__ void dequant_gguf_q2_k(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q2_K* x = reinterpret_cast<const block_q2_K*>(vx);
+    const size_t tid = threadIdx.x;
+    const size_t n   = tid / 32;
+    const size_t l   = tid - 32 * n;
+    const size_t is  = 8 * n + l / 16;
+
+    const u8 q = x[i].qs[32 * n + l];
+    const float dall = h2f(x[i].d);
+    const float dmin = h2f(x[i].dmin);
+    const size_t base = i * QK_K + 128 * n;
+
+    stf(yy, kind, base + l +  0, dall * (float)(x[i].scales[is + 0] & 0xF) * (float)((q >> 0) & 3) - dmin * (float)(x[i].scales[is + 0] >> 4));
+    stf(yy, kind, base + l + 32, dall * (float)(x[i].scales[is + 2] & 0xF) * (float)((q >> 2) & 3) - dmin * (float)(x[i].scales[is + 2] >> 4));
+    stf(yy, kind, base + l + 64, dall * (float)(x[i].scales[is + 4] & 0xF) * (float)((q >> 4) & 3) - dmin * (float)(x[i].scales[is + 4] >> 4));
+    stf(yy, kind, base + l + 96, dall * (float)(x[i].scales[is + 6] & 0xF) * (float)((q >> 6) & 3) - dmin * (float)(x[i].scales[is + 6] >> 4));
+}
+
+extern "C" __global__ void dequant_gguf_q3_k(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q3_K* x = reinterpret_cast<const block_q3_K*>(vx);
+
+    const int r   = threadIdx.x / 4;
+    const int tid = r / 2;
+    const int is0 = r % 2;
+    const int l0  = 16 * is0 + 4 * (threadIdx.x % 4);
+    const int n   = tid / 4;
+    const int j   = tid - 4 * n;
+
+    const u8 m = 1 << (4 * n + j);
+    const int is = 8 * n + 2 * j + is0;
+    const int shift = 2 * j;
+
+    const signed char us = is <  4 ? (x[i].scales[is - 0] & 0xF) | (((x[i].scales[is + 8] >> 0) & 3) << 4) :
+                           is <  8 ? (x[i].scales[is - 0] & 0xF) | (((x[i].scales[is + 4] >> 2) & 3) << 4) :
+                           is < 12 ? (x[i].scales[is - 8] >>  4) | (((x[i].scales[is + 0] >> 4) & 3) << 4) :
+                                     (x[i].scales[is - 8] >>  4) | (((x[i].scales[is - 4] >> 6) & 3) << 4);
+    const float d_all = h2f(x[i].d);
+    const float dl = d_all * (float)(us - 32);
+
+    const size_t y_base = i * QK_K + 128 * n + 32 * j;
+    const u8* q  = x[i].qs + 32 * n;
+    const u8* hm = x[i].hmask;
+
+    #pragma unroll
+    for (int l = l0; l < l0 + 4; ++l) {
+        float val = dl * (float)((signed char)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+        stf(yy, kind, y_base + l, val);
+    }
+}
+
+extern "C" __global__ void dequant_gguf_q4_k(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q4_K* x = reinterpret_cast<const block_q4_K*>(vx);
+
+    const int tid = threadIdx.x;
+    const int il  = tid / 8;
+    const int ir  = tid % 8;
+    const int is  = 2 * il;
+    const int n   = 4;
+
+    const size_t y_base = i * QK_K + 64 * il + n * ir;
+    const float dall = h2f(x[i].d);
+    const float dmin = h2f(x[i].dmin);
+    const u8* q = x[i].qs + 32 * il + n * ir;
+
+    u8 sc, m;
+    get_scale_min_k4(is + 0, x[i].scales, sc, m);
+    const float d1 = dall * (float)sc; const float m1 = dmin * (float)m;
+    get_scale_min_k4(is + 1, x[i].scales, sc, m);
+    const float d2 = dall * (float)sc; const float m2 = dmin * (float)m;
+
+    #pragma unroll
+    for (int l = 0; l < n; ++l) {
+        stf(yy, kind, y_base + l +  0, d1 * (float)(q[l] & 0xF) - m1);
+        stf(yy, kind, y_base + l + 32, d2 * (float)(q[l] >>  4) - m2);
+    }
+}
+
+extern "C" __global__ void dequant_gguf_q5_k(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q5_K* x = reinterpret_cast<const block_q5_K*>(vx);
+
+    const int tid = threadIdx.x;
+    const int il  = tid / 16;
+    const int ir  = tid % 16;
+    const int is  = 2 * il;
+
+    const size_t y_base = i * QK_K + 64 * il + 2 * ir;
+    const float dall = h2f(x[i].d);
+    const float dmin = h2f(x[i].dmin);
+
+    const u8* ql = x[i].qs + 32 * il + 2 * ir;
+    const u8* qh = x[i].qh + 2 * ir;
+
+    u8 sc, m;
+    get_scale_min_k4(is + 0, x[i].scales, sc, m);
+    const float d1 = dall * (float)sc; const float m1 = dmin * (float)m;
+    get_scale_min_k4(is + 1, x[i].scales, sc, m);
+    const float d2 = dall * (float)sc; const float m2 = dmin * (float)m;
+
+    u8 hm = 1 << (2 * il);
+    stf(yy, kind, y_base +  0, d1 * (float)((ql[0] & 0xF) + ((qh[0] & hm) ? 16 : 0)) - m1);
+    stf(yy, kind, y_base +  1, d1 * (float)((ql[1] & 0xF) + ((qh[1] & hm) ? 16 : 0)) - m1);
+    hm <<= 1;
+    stf(yy, kind, y_base + 32, d2 * (float)((ql[0] >>  4) + ((qh[0] & hm) ? 16 : 0)) - m2);
+    stf(yy, kind, y_base + 33, d2 * (float)((ql[1] >>  4) + ((qh[1] & hm) ? 16 : 0)) - m2);
+}
+
+extern "C" __global__ void dequant_gguf_q6_k(const void* __restrict__ vx, void* __restrict__ yy, int kind) {
+    const size_t i = blockIdx.x;
+    const block_q6_K* x = reinterpret_cast<const block_q6_K*>(vx);
+
+    const int tid = threadIdx.x;
+    const int ip  = tid / 32;
+    const int il  = tid - 32 * ip;
+    const int is  = 8 * ip + il / 16;
+
+    const size_t y_base = i * QK_K + 128 * ip + il;
+    const float d = h2f(x[i].d);
+
+    const u8* ql = x[i].ql + 64 * ip + il;
+    const u8  qh = x[i].qh[32 * ip + il];
+    const signed char* sc = x[i].scales + is;
+
+    stf(yy, kind, y_base +  0, d * (float)sc[0] * (float)((signed char)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+    stf(yy, kind, y_base + 32, d * (float)sc[2] * (float)((signed char)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+    stf(yy, kind, y_base + 64, d * (float)sc[4] * (float)((signed char)((ql[ 0] >>  4) | (((qh >> 4) & 3) << 4)) - 32));
+    stf(yy, kind, y_base + 96, d * (float)sc[6] * (float)((signed char)((ql[32] >>  4) | (((qh >> 6) & 3) << 4)) - 32));
+}
+
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -1025,6 +1242,7 @@ fn kind_of(dt: DType) -> Result<i32> {
         DType::F32 => 0,
         DType::F16 => 1,
         DType::BF16 => 2,
+        DType::U8 => 3,
         d => candle_core::bail!("unsupported kernel dtype {d:?}"),
     })
 }
@@ -2229,4 +2447,78 @@ pub fn copy_host_pinned_to_tensor_offset_async(src_host: *const u8, t: &Tensor, 
         }
         _ => candle_core::bail!("needs cuda tensor"),
     }
+}
+
+fn tensor_dev_ptr(t: &Tensor) -> Result<u64> {
+    let (st, l) = t.storage_and_layout();
+    match &*st {
+        candle_core::Storage::Cuda(cs) => dev_ptr(cs, l),
+        _ => candle_core::bail!("tensor must be on CUDA device"),
+    }
+}
+
+pub fn dequant_gguf(raw_u8: &Tensor, gtype: crate::weights::GgmlType, out_features: usize, in_features: usize, out_dtype: DType) -> Result<Tensor> {
+    use crate::weights::GgmlType;
+
+    let blk_elems = gtype.block_elements();
+    let blk_bytes = gtype.block_bytes();
+
+    if in_features % blk_elems != 0 {
+        candle_core::bail!("dequant_gguf: in_features {in_features} not divisible by block_elements {blk_elems}");
+    }
+
+    let num_elements = (out_features as u64)
+        .checked_mul(in_features as u64)
+        .ok_or_else(|| candle_core::Error::Msg("dequant_gguf: num_elements u64 overflow".into()))?;
+    let num_blocks = num_elements / (blk_elems as u64);
+    if num_blocks > i32::MAX as u64 {
+        candle_core::bail!("dequant_gguf: num_blocks {num_blocks} exceeds i32::MAX (grid_dim.x limit)");
+    }
+    let expected_src_bytes = (num_blocks as usize) * blk_bytes;
+
+    if raw_u8.elem_count() != expected_src_bytes {
+        candle_core::bail!(
+            "dequant_gguf {:?} byte count mismatch: tensor has {}B, expected {}B for shape [{out_features}, {in_features}]",
+            gtype,
+            raw_u8.elem_count(),
+            expected_src_bytes
+        );
+    }
+
+    let dev = raw_u8.device();
+    // 1. Checkout from PingPongArena (zero dynamic alloc_out)
+    let out = crate::weights::checkout_dequant_arena(dev, out_dtype, out_features, in_features)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+    let (kname, block_x) = match gtype {
+        GgmlType::Q4_0 => ("dequant_gguf_q4_0", 32u32),
+        GgmlType::Q8_0 => ("dequant_gguf_q8_0", 32u32),
+        GgmlType::Q2K  => ("dequant_gguf_q2_k",  64u32),
+        GgmlType::Q3K  => ("dequant_gguf_q3_k",  64u32),
+        GgmlType::Q4K  => ("dequant_gguf_q4_k",  32u32),
+        GgmlType::Q5K  => ("dequant_gguf_q5_k",  64u32),
+        GgmlType::Q6K  => ("dequant_gguf_q6_k",  64u32),
+        _ => candle_core::bail!("dequant_gguf: unsupported or guarded type {:?}", gtype),
+    };
+
+    let kind = kind_of(out_dtype)?;
+
+    let qp = tensor_dev_ptr(raw_u8)?;
+    let op = tensor_dev_ptr(&out)?;
+
+    let cuda_dev = match dev {
+        candle_core::Device::Cuda(c) => c,
+        _ => candle_core::bail!("raw tensor must be on CUDA device"),
+    };
+    let func = cuda_dev.get_or_load_custom_func(kname, MODULE, ptx()?)?;
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (block_x, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = func.builder();
+    b.arg(&qp).arg(&op).arg(&kind);
+    unsafe { b.launch(cfg) }.w()?;
+
+    Ok(out)
 }

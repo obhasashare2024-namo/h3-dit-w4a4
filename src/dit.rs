@@ -16,6 +16,39 @@ use crate::lora::Lora;
 use crate::ops;
 use crate::weights::{Held, Placement, QFormat, QLinear, SafeFile};
 
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::sys;
+#[cfg(feature = "cuda")]
+use candle_core::{cuda_backend::CudaStorageSlice, Storage};
+
+#[cfg(feature = "cuda")]
+fn tensor_dptr_and_bytes(t: &Tensor) -> Result<(u64, usize)> {
+    let (st, l) = t.storage_and_layout();
+    let Storage::Cuda(c) = &*st else {
+        bail!("Expected CUDA tensor");
+    };
+    let stream = c.device.cuda_stream();
+    let (ptr, elem_bytes) = match &c.slice {
+        CudaStorageSlice::BF16(slice) => {
+            let (p, _guard) = slice.device_ptr(&stream);
+            (p, 2)
+        }
+        CudaStorageSlice::F16(slice) => {
+            let (p, _guard) = slice.device_ptr(&stream);
+            (p, 2)
+        }
+        CudaStorageSlice::F32(slice) => {
+            let (p, _guard) = slice.device_ptr(&stream);
+            (p, 4)
+        }
+        _ => bail!("Unsupported storage slice for direct dptr"),
+    };
+    let total_bytes = t.elem_count() * elem_bytes;
+    Ok((ptr + (l.start_offset() * elem_bytes) as u64, total_bytes))
+}
+
 pub const FRAME_PER_TOKEN: [usize; 5] = [1, 4, 4, 4, 4];
 pub const FRAME_RESCALE: f64 = 5.0 / 3.0;
 pub const VISUAL_COND_TIMESTEP: f64 = 0.999;
@@ -444,6 +477,8 @@ pub struct Dit {
     pub captured: std::cell::RefCell<Vec<(usize, Tensor)>>,
     #[cfg(feature = "cuda")]
     pub streaming: Option<crate::streaming::StreamingEngine>,
+    #[cfg(feature = "cuda")]
+    pub(crate) offload_x_pinned: std::sync::Mutex<Option<crate::streaming::ContiguousPinnedBuffer>>,
 }
 
 /// Conditioning for one sampling run.
@@ -762,6 +797,8 @@ impl Dit {
             captured: Default::default(),
             #[cfg(feature = "cuda")]
             streaming,
+            #[cfg(feature = "cuda")]
+            offload_x_pinned: std::sync::Mutex::new(None),
             cfg,
         };
         if let Some((l, strength)) = lora {
@@ -961,12 +998,11 @@ impl Dit {
         if let Some(g) = std::env::var("H3_ATTN_GROUPS").ok().and_then(|v| v.parse::<usize>().ok()) {
             return if g >= 1 && self.cfg.heads % g == 0 { g } else { 1 };
         }
-        if tokens > 140000 {
-            return 28;
-        } else if tokens > 85000 {
-            return 14;
-        } else if tokens > 55000 {
-            return 4;
+        let (free_vram_attn, _) = crate::config::vram_info().unwrap_or((0, 0));
+        if free_vram_attn > 3_500_000_000 {
+            if tokens > 140000 { return 14; } else if tokens > 80000 { return 14; } else if tokens > 30000 { return 4; }
+        } else {
+            if tokens > 95000 { return 28; } else if tokens > 65000 { return 14; } else if tokens > 30000 { return 4; }
         }
         let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
         let is_w4a4 = matches!(lin.fmt, crate::weights::QFormat::AmpereW4A4Preswizzled { .. });
@@ -1006,16 +1042,17 @@ impl Dit {
         println!("[attend_factorized] start: s={}, groups={}, w={}, chunk={}, free VRAM={:.2} GB", s, groups, w, chunk, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
 
         let inner = h * d;
-        let offload_att = s > 140000;
-        let att_bytes = if !offload_att { s * inner * 2 } else { 0 };
-        let needed_mid_bytes = 3 * s * 768 * 2;
         let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
+        let att_bytes_calc = s * inner * 2;
+        let offload_att = s > 140000 || (s > 30000 && free_vram_start < att_bytes_calc + 1_000_000_000);
+        let att_bytes = if !offload_att { att_bytes_calc } else { 0 };
+        let needed_mid_bytes = 3 * s * 768 * 2;
         let offload_mid = s > 140000 || (s > 30000 && free_vram_start < needed_mid_bytes + att_bytes + 500_000_000);
         let (mid_q, mid_k, mid_v) = if offload_mid {
             println!("[attend_factorized] offloading mid_q/k/v to CPU (s={}, free VRAM={:.2} GB, required={:.2} GB)", s, free_vram_start as f64 / 1e9, (needed_mid_bytes + att_bytes) as f64 / 1e9);
-            let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
-            let mid_k_cpu = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
-            let mid_v_cpu = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?.to_device(&candle_core::Device::Cpu)?;
+            let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked_to_device(&n1, chunk, &candle_core::Device::Cpu))?;
+            let mid_k_cpu = prof::time("k down", &self.dev, || k.down.forward_chunked_to_device(&n1, chunk, &candle_core::Device::Cpu))?;
+            let mid_v_cpu = prof::time("v down", &self.dev, || v.down.forward_chunked_to_device(&n1, chunk, &candle_core::Device::Cpu))?;
             drop(n1);
             let _ = self.dev.synchronize();
             let (free_after_drop, _) = crate::config::vram_info().unwrap_or((0, 0));
@@ -1121,7 +1158,9 @@ impl Dit {
             let r0 = base + g * w;
             qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
         };
-        let offload_att = s > 140000;
+        let (free_vram_att, _) = crate::config::vram_info().unwrap_or((0, 0));
+        let att_bytes_calc = s * inner * 2;
+        let offload_att = s > 140000 || (s > 30000 && free_vram_att < att_bytes_calc + 1_000_000_000);
         println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, offload_att={}", s, groups, w, offload_att);
         let pinned_att = if offload_att {
             println!("[attend_grouped_qkv] Using Phase 3.2b-lite Pinned Host Attention Buffer (Zero CPU Cat)");
@@ -1363,11 +1402,13 @@ impl Dit {
 
     /// One transformer block over the packed stream `x` (shared by the base blocks and the ControlNet's), given its
     /// weights already fetched as `[qkv, out, fc1, fc2]`.
-    pub(crate) fn run_block(&self, b: &Block, raws: Option<[crate::weights::Raw; 4]>, mut x: Tensor, cx: &StepCtx) -> Result<Tensor> {
+    pub(crate) fn run_block(&self, b: &Block, mut raws: Option<[crate::weights::Raw; 4]>, mut x: Tensor, cx: &StepCtx) -> Result<Tensor> {
         let dev = &self.dev;
         let (h, d, hidden) = (self.cfg.heads, self.cfg.head_dim, self.cfg.hidden);
         let rot = cx.rope.dim(2)? * 2;
-        let chunk = self.mem.token_chunk;
+        let s_init = x.dim(0)?;
+        let (free_vram_rb, _) = crate::config::vram_info().unwrap_or((0, 0));
+        let chunk = if free_vram_rb < 2_500_000_000 && s_init > 80000 { 1024 } else { self.mem.token_chunk.max(4096) };
         let te = if cx.curve { cx.t_emb.clone() } else { ops::silu(cx.t_emb)?.to_dtype(self.dtype)? };
         let m = b.adaln.forward(&te)?.to_dtype(DType::F32)?; // [U, 6*hidden*3]
         let m = m.reshape((cx.u * 3, 6 * hidden))?;
@@ -1387,26 +1428,50 @@ impl Dit {
                     }
                 } else {
                     let tokens = x.dim(0)?;
-                    if tokens > 140000 {
-                        28 // 12s+: 2 heads per group, single QKV = 280MB, 256-byte aligned
-                    } else if tokens > 85000 {
-                        14 // 8s: 4 heads per group, single QKV = 372MB, 256-byte aligned
-                    } else if tokens > 55000 {
-                        4  // 5s: 14 heads per group, single QKV = 860MB, validated 306s
+                    if free_vram_rb > 3_500_000_000 {
+                        if tokens > 140000 { 14 } else if tokens > 80000 { 14 } else if tokens > 30000 { 4 } else { 1 }
                     } else {
-                        4  // 3s: 14 heads per group, validated 137s
+                        if tokens > 95000 { 28 } else if tokens > 65000 { 14 } else if tokens > 30000 { 4 } else { 1 }
                     }
                 }
             }
         };
-        let (n1, x_saved, mut x_holder, dev_ref) = if x.dim(0)? > 30000 {
-            println!("[dit] run_block: offloading x to CPU (IN-PLACE NORM1), free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
-            let x_cpu = prof::time("offload x", dev, || x.to_device(&Device::Cpu))?;
+        let (n1, x_saved, x_holder, dev_ref) = if x.dim(0)? > 30000 {
+            println!("[dit] run_block: offloading x to PINNED HOST DMA (IN-PLACE NORM1), free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+            let s_dim = x.dim(0)?;
+            let hidden_dim = x.dim(1)?;
+            let (src_dptr, total_bytes) = tensor_dptr_and_bytes(&x)?;
+            let Device::Cuda(cd) = dev else { bail!("CUDA device required for pinned offload") };
+            let stream = cd.cuda_stream().cu_stream();
+
+            let mut pinned_lock = self.offload_x_pinned.lock().map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+            let need_realloc = match &*pinned_lock {
+                Some(b) => b.as_ptr().is_null() || b.len() < total_bytes,
+                None => true,
+            };
+            if need_realloc {
+                *pinned_lock = Some(crate::streaming::ContiguousPinnedBuffer::alloc(total_bytes, false)?);
+            }
+            let pinned_buf = pinned_lock.as_ref().unwrap();
+            let pinned_ptr = pinned_buf.as_ptr() as *mut std::ffi::c_void;
+
+            prof::time("offload x pinned DtoH", dev, || -> Result<()> {
+                unsafe {
+                    let res = sys::cuMemcpyDtoHAsync_v2(pinned_ptr, src_dptr as sys::CUdeviceptr, total_bytes, stream);
+                    if res != sys::CUresult::CUDA_SUCCESS {
+                        bail!("cuMemcpyDtoHAsync_v2 failed: {:?}", res);
+                    }
+                }
+                dev.synchronize()?;
+                Ok(())
+            })?;
+            drop(pinned_lock);
+
             prof::time("norm/mod in-place", dev, || kernels::rms_modulate_inplace(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx))?;
             println!("[dit] run_block: x modulated in-place -> n1, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
-            (x, Some(x_cpu), None, dev)
+            (x, Some((s_dim, hidden_dim, total_bytes)), None, dev)
         } else {
-            let mut x_h = Some(x);
+            let x_h = Some(x);
             let n1 = {
                 let x_ref = x_h.as_ref().unwrap();
                 prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?
@@ -1440,10 +1505,31 @@ impl Dit {
             AttResult::Gpu(t) => t.dim(0)?,
             AttResult::Pinned(p) => p.s,
         };
-        let mut x = if let Some(x_cpu) = x_saved {
+        let mut x = if let Some((s_dim, hidden_dim, total_bytes)) = x_saved {
             let (free_x, _) = crate::config::vram_info().unwrap_or((0, 0));
-            println!("[dit] run_block: transferring x from CPU back to GPU, free VRAM={:.2} GB, required={:.2} GB", free_x as f64 / 1e9, (s * 5376 * 2) as f64 / 1e9);
-            x_cpu.to_device(dev_ref)?
+            println!("[dit] run_block: transferring x from PINNED HOST back to GPU (DMA), free VRAM={:.2} GB, required={:.2} GB", free_x as f64 / 1e9, total_bytes as f64 / 1e9);
+            let Device::Cuda(cd) = dev_ref else { bail!("CUDA device required for pinned offload") };
+            let stream = cd.cuda_stream().cu_stream();
+
+            let x_restored = Tensor::zeros((s_dim, hidden_dim), self.dtype, dev_ref)?;
+            let (dst_dptr, _) = tensor_dptr_and_bytes(&x_restored)?;
+
+            let pinned_lock = self.offload_x_pinned.lock().map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+            let pinned_buf = pinned_lock.as_ref().unwrap();
+            let pinned_ptr = pinned_buf.as_ptr() as *const std::ffi::c_void;
+
+            prof::time("offload x pinned HtoD", dev_ref, || -> Result<()> {
+                unsafe {
+                    let res = sys::cuMemcpyHtoDAsync_v2(dst_dptr as sys::CUdeviceptr, pinned_ptr, total_bytes, stream);
+                    if res != sys::CUresult::CUDA_SUCCESS {
+                        bail!("cuMemcpyHtoDAsync_v2 failed: {:?}", res);
+                    }
+                }
+                dev_ref.synchronize()?;
+                Ok(())
+            })?;
+            drop(pinned_lock);
+            x_restored
         } else {
             x_holder.unwrap()
         };
@@ -1601,10 +1687,14 @@ impl Dit {
 
         let s = x.dim(0)?;
         if s > 30000 {
+            if let Some(ref mut r) = raws {
+                r[0] = crate::weights::Raw { w: Tensor::zeros((1,), self.dtype, dev)?, bs: None };
+                r[1] = crate::weights::Raw { w: Tensor::zeros((1,), self.dtype, dev)?, bs: None };
+            }
             let (free_vram_mlp, _) = crate::config::vram_info().unwrap_or((0, 0));
             println!("[dit] run_block: mlp start (IN-PLACE GPU RESIDUAL), free VRAM={:.2} GB", free_vram_mlp as f64 / 1e9);
             prof::time("mlp_inplace", dev, || -> Result<()> {
-                let mc = self.mem.mlp_chunk.max(1);
+                let mc = if free_vram_mlp < 2_500_000_000 && s > 80000 { 1024 } else { self.mem.mlp_chunk.max(4096) };
                 match (&b.fc1, &b.fc2, &raws) {
                     (LinProj::Single(fc1), LinProj::Single(fc2), Some([_, _, r_fc1, r_fc2])) => {
                         let w1 = prof::time("dequant", dev, || fc1.prepare(r_fc1.clone(), dev, self.dtype))?;

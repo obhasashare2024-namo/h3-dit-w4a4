@@ -11,10 +11,186 @@ use memmap2::Mmap;
 
 use crate::kernels;
 
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GgmlType {
+    Q4_0    = 2,
+    Q8_0    = 8,
+    Q2K     = 10,
+    Q3K     = 11,
+    Q4K     = 12,
+    Q5K     = 13,
+    Q6K     = 14,
+    IQ2XXS  = 16,
+    IQ2XS   = 17,
+    IQ3XXS  = 18,
+    IQ4NL   = 20,
+    IQ3S    = 21,
+    IQ2S    = 22,
+    IQ4XS   = 23,
+    F64     = 28,
+    IQ1_M   = 29,
+    TQ1_0   = 34,
+    TQ2_0   = 35,
+}
+
+impl GgmlType {
+    pub fn from_u32(t: u32) -> Option<Self> {
+        match t {
+            2  => Some(Self::Q4_0),
+            8  => Some(Self::Q8_0),
+            10 => Some(Self::Q2K),
+            11 => Some(Self::Q3K),
+            12 => Some(Self::Q4K),
+            13 => Some(Self::Q5K),
+            14 => Some(Self::Q6K),
+            16 => Some(Self::IQ2XXS),
+            17 => Some(Self::IQ2XS),
+            18 => Some(Self::IQ3XXS),
+            20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            22 => Some(Self::IQ2S),
+            23 => Some(Self::IQ4XS),
+            28 => Some(Self::F64),
+            29 => Some(Self::IQ1_M),
+            34 => Some(Self::TQ1_0),
+            35 => Some(Self::TQ2_0),
+            _  => None,
+        }
+    }
+
+    pub const fn block_elements(self) -> usize {
+        match self {
+            Self::F64 => 1,
+            Self::Q4_0 | Self::Q8_0 | Self::IQ4NL => 32,
+            _ => 256,
+        }
+    }
+
+    pub const fn block_bytes(self) -> usize {
+        match self {
+            Self::Q4_0   => 18,
+            Self::Q8_0   => 34,
+            Self::Q2K    => 84,
+            Self::Q3K    => 110,
+            Self::Q4K    => 144,
+            Self::Q5K    => 176,
+            Self::Q6K    => 210,
+            Self::IQ2XXS => 66,
+            Self::IQ2XS  => 74,
+            Self::IQ3XXS => 98,
+            Self::IQ4NL  => 18,
+            Self::IQ3S   => 110,
+            Self::IQ2S   => 82,
+            Self::IQ4XS  => 136,
+            Self::F64    => 8,
+            Self::IQ1_M  => 56,
+            Self::TQ1_0  => 34,
+            Self::TQ2_0  => 66,
+        }
+    }
+
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Q4_0   => "GGUF_Q4_0",
+            Self::Q8_0   => "GGUF_Q8_0",
+            Self::Q2K    => "GGUF_Q2_K",
+            Self::Q3K    => "GGUF_Q3_K",
+            Self::Q4K    => "GGUF_Q4_K",
+            Self::Q5K    => "GGUF_Q5_K",
+            Self::Q6K    => "GGUF_Q6_K",
+            Self::IQ2XXS => "GGUF_IQ2_XXS",
+            Self::IQ2XS  => "GGUF_IQ2_XS",
+            Self::IQ3XXS => "GGUF_IQ3_XXS",
+            Self::IQ4NL  => "GGUF_IQ4_NL",
+            Self::IQ3S   => "GGUF_IQ3_S",
+            Self::IQ2S   => "GGUF_IQ2_S",
+            Self::IQ4XS  => "GGUF_IQ4_XS",
+            Self::F64    => "GGUF_F64",
+            Self::IQ1_M  => "GGUF_IQ1_M",
+            Self::TQ1_0  => "GGUF_TQ1_0",
+            Self::TQ2_0  => "GGUF_TQ2_0",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "GGUF_Q4_0"   => Some(Self::Q4_0),
+            "GGUF_Q8_0"   => Some(Self::Q8_0),
+            "GGUF_Q2_K"   => Some(Self::Q2K),
+            "GGUF_Q3_K"   => Some(Self::Q3K),
+            "GGUF_Q4_K"   => Some(Self::Q4K),
+            "GGUF_Q5_K"   => Some(Self::Q5K),
+            "GGUF_Q6_K"   => Some(Self::Q6K),
+            "GGUF_IQ2_XXS" => Some(Self::IQ2XXS),
+            "GGUF_IQ2_XS"  => Some(Self::IQ2XS),
+            "GGUF_IQ3_XXS" => Some(Self::IQ3XXS),
+            "GGUF_IQ4_NL"  => Some(Self::IQ4NL),
+            "GGUF_IQ3_S"   => Some(Self::IQ3S),
+            "GGUF_IQ2_S"   => Some(Self::IQ2S),
+            "GGUF_IQ4_XS"  => Some(Self::IQ4XS),
+            "GGUF_F64"     => Some(Self::F64),
+            "GGUF_IQ1_M"   => Some(Self::IQ1_M),
+            "GGUF_TQ1_0"   => Some(Self::TQ1_0),
+            "GGUF_TQ2_0"   => Some(Self::TQ2_0),
+            _ => None,
+        }
+    }
+}
+
+/// 雙槽 Ping-Pong 零分配反量化 Arena
+struct PingPongArena {
+    slots: [Option<Tensor>; 2],
+    cursor: usize,
+}
+
+impl Default for PingPongArena {
+    fn default() -> Self {
+        Self { slots: [None, None], cursor: 0 }
+    }
+}
+
+thread_local! {
+    static DEQUANT_ARENA: std::cell::RefCell<HashMap<(candle_core::DeviceLocation, DType), PingPongArena>> = Default::default();
+}
+
+/// 從全局 Arena 檢出形狀為 [rows, cols] 的輸出張量視圖 (O(1) 零分配，消滅 1,128 次 alloc_out)
+pub fn checkout_dequant_arena(dev: &Device, dtype: DType, rows: usize, cols: usize) -> Result<Tensor> {
+    let needed = rows.checked_mul(cols).ok_or_else(|| candle_core::Error::Msg("Dequant dimension overflow".into()))?;
+    if needed == 0 {
+        bail!("checkout_dequant_arena: zero-sized tensor is not allowed");
+    }
+    let key = (dev.location(), dtype);
+
+    DEQUANT_ARENA.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let arena = map.entry(key).or_default();
+        let slot_idx = arena.cursor;
+        arena.cursor = (arena.cursor + 1) & 1;
+
+        let need_realloc = match &arena.slots[slot_idx] {
+            Some(buf) => buf.elem_count() < needed,
+            None => true,
+        };
+
+        if need_realloc {
+            arena.slots[slot_idx] = None;
+            let cap = needed.max(5376 * 21504);
+            let new_buf = Tensor::zeros((cap,), dtype, dev)?;
+            arena.slots[slot_idx] = Some(new_buf);
+        }
+
+        let buf = arena.slots[slot_idx].as_ref().unwrap();
+        Ok(buf.narrow(0, 0, needed)?.reshape((rows, cols))?)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub dtype: String,
     pub shape: Vec<usize>,
+    pub storage_shape: Vec<usize>,
     pub start: usize,
     pub end: usize,
 }
@@ -145,21 +321,42 @@ fn parse_gguf(mmap: &[u8]) -> Result<(usize, HashMap<String, TensorInfo>, HashMa
         let offset = u64::from_le_bytes(mmap[pos..pos+8].try_into()?) as usize;
         pos += 8;
 
-        let (dtype_str, byte_size) = match type_id {
-            0 => ("F32", num_elements * 4),
-            1 => ("F16", num_elements * 2),
-            16 => ("I8", num_elements * 1),
-            17 => ("I16", num_elements * 2),
-            18 => ("I32", num_elements * 4),
-            19 => ("I64", num_elements * 8),
-            29 | 30 => ("BF16", num_elements * 2),
+        let (dtype_str, byte_size, storage_shape) = match type_id {
+            0 => ("F32".to_string(), num_elements * 4, dims.clone()),
+            1 => ("F16".to_string(), num_elements * 2, dims.clone()),
+            24 => ("I8".to_string(),  num_elements * 1, dims.clone()),
+            25 => ("I16".to_string(), num_elements * 2, dims.clone()),
+            26 => ("I32".to_string(), num_elements * 4, dims.clone()),
+            27 => ("I64".to_string(), num_elements * 8, dims.clone()),
+            28 => ("F64".to_string(), num_elements * 8, dims.clone()),
+            29 => bail!("GGUF tensor {name}: IQ1_M (type 29) is guarded and requires dedicated grid codebook"),
+            30 => ("BF16".to_string(), num_elements * 2, dims.clone()),
+            t if GgmlType::from_u32(t).is_some() => {
+                let gt = GgmlType::from_u32(t).unwrap();
+                let blk_elems = gt.block_elements();
+                let blk_bytes = gt.block_bytes();
+                if num_elements % blk_elems != 0 {
+                    bail!("GGUF tensor {name} elements {num_elements} not divisible by {blk_elems}");
+                }
+                let total_bytes = (num_elements / blk_elems) * blk_bytes;
+                let mut s_dims = dims.clone();
+                if s_dims.len() >= 2 {
+                    let k = s_dims.pop().unwrap();
+                    let row_bytes = (k / blk_elems) * blk_bytes;
+                    s_dims.push(row_bytes);
+                } else {
+                    s_dims = vec![total_bytes];
+                }
+                (gt.tag().to_string(), total_bytes, s_dims)
+            }
             t => bail!("unsupported gguf tensor type {t}"),
         };
 
         let k = name.strip_prefix("model.diffusion_model.").map(str::to_string).unwrap_or(name);
         tensors.insert(k, TensorInfo {
-            dtype: dtype_str.to_string(),
+            dtype: dtype_str,
             shape: dims,
+            storage_shape,
             start: offset,
             end: offset + byte_size,
         });
@@ -191,12 +388,12 @@ impl SafeFile {
                 continue;
             }
             let dtype = v["dtype"].as_str().unwrap_or_default().to_string();
-            let shape = v["shape"].as_array().context("shape")?.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect();
+            let shape: Vec<usize> = v["shape"].as_array().context("shape")?.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect();
             let offs = v["data_offsets"].as_array().context("offsets")?;
             let (start, end) = (offs[0].as_u64().unwrap_or(0) as usize, offs[1].as_u64().unwrap_or(0) as usize);
             // some exports keep the ComfyUI checkpoint prefix on the diffusion model's tensors
             let k = k.strip_prefix("model.diffusion_model.").map(str::to_string).unwrap_or(k);
-            tensors.insert(k, TensorInfo { dtype, shape, start, end });
+            tensors.insert(k, TensorInfo { dtype, shape: shape.clone(), storage_shape: shape, start, end });
         }
         Ok(Arc::new(Self { path: path.display().to_string(), fh: file, mmap, data_start: 8 + n, tensors, metadata }))
     }
@@ -245,6 +442,7 @@ impl SafeFile {
             "F16" => DType::F16,
             "BF16" => DType::BF16,
             "I8" | "U8" | "F8_E4M3" | "BOOL" => DType::U8,
+            dt if dt.starts_with("GGUF_") => DType::U8,
             "I64" => DType::I64,
             "I32" => DType::I32,
             "F64" => DType::F64,
@@ -256,7 +454,7 @@ impl SafeFile {
     pub fn load(&self, name: &str, dev: &Device) -> Result<Tensor> {
         let i = self.info(name)?;
         let dt = Self::storage_dtype(&i.dtype)?;
-        let shape = if i.shape.is_empty() { vec![1] } else { i.shape.clone() };
+        let shape = if i.storage_shape.is_empty() { vec![1] } else { i.storage_shape.clone() };
         Ok(Tensor::from_raw_buffer(self.bytes(name)?, dt, &shape, dev)?)
     }
 
@@ -471,7 +669,7 @@ impl Held {
                 let dt = SafeFile::storage_dtype(&i.dtype)?;
                 let pinned = if dt == DType::U8 || dt == DType::I32 || dt == DType::U32 { pin_bytes(file.bytes(name)?, dev) } else { None };
                 match pinned {
-                    Some(buf) => Held::Pinned { buf, shape: i.shape.clone() },
+                    Some(buf) => Held::Pinned { buf, shape: i.storage_shape.clone() },
                     None => Held::Host(file.load(name, &Device::Cpu)?),
                 }
             }
@@ -508,7 +706,7 @@ impl Held {
                 let i = file.info(name)?;
                 let dt = SafeFile::storage_dtype(&i.dtype)?;
                 if (dt == DType::U8 || dt == DType::I32 || dt == DType::U32) && dev.is_cuda() {
-                    upload_from_file(file, name, &i.shape, dev)?
+                    upload_from_file(file, name, &i.storage_shape, dev)?
                 } else {
                     file.load(name, dev)?
                 }
@@ -583,6 +781,12 @@ pub enum QFormat {
     SymW4A4 { convrot: Option<usize>, group_size: usize },
     /// Ampere SM86 Preswizzled W4A4 INT4 Tensor Core format (zero dequant, native mma.m16n8k64).
     AmpereW4A4Preswizzled { convrot: Option<usize>, group_size: usize },
+    /// Ampere SM86 Preswizzled W4A8 INT8 Tensor Core format (zero dequant, native mma.m16n8k32).
+    AmpereW4A8Preswizzled { convrot: Option<usize>, group_size: usize },
+    /// HyperFlow Community W4A16 format (4-bit weights with FP16/BF16 scale).
+    W4A16 { convrot: Option<usize>, group_size: usize },
+    /// GGUF K-Quant and basic quant formats (Phase 5A universal multi-quant dequantization).
+    GgufQuant { gtype: GgmlType },
 }
 
 /// A low-rank delta `scale * B @ A` added to a linear layer's output.
@@ -694,7 +898,14 @@ impl QLinear {
         let bias = if file.has(&bias_name) { Some(file.load_as(&bias_name, dev, DType::F32)?) } else { None };
         let fmt_name = conf.as_ref().and_then(|c| c["format"].as_str().map(str::to_string));
         let (fmt, scale, block_scale, pqs, in_features) = match fmt_name.as_deref() {
-            None => (QFormat::Dense, None, None, None, wshape[1]),
+            None => {
+                let info = file.info(&wname)?;
+                if let Some(gt) = GgmlType::from_tag(&info.dtype) {
+                    (QFormat::GgufQuant { gtype: gt }, None, None, None, wshape[1])
+                } else {
+                    (QFormat::Dense, None, None, None, wshape[1])
+                }
+            }
             Some("int8_tensorwise") => {
                 let c = conf.as_ref().unwrap();
                 let convrot = if c["convrot"].as_bool().unwrap_or(false) {
@@ -743,10 +954,43 @@ impl QLinear {
                 let k_in = wshape[1] * 64;
                 (QFormat::AmpereW4A4Preswizzled { convrot, group_size }, Some(s), None, None, k_in)
             }
+            Some("ampere_w4a8_preswizzled") | Some("w4a8_preswizzled") | Some("ampere_w4a8") => {
+                let c = conf.as_ref();
+                let convrot = if c.and_then(|v| v.get("convrot")).and_then(|v| v.as_bool()).unwrap_or(false) {
+                    Some(c.and_then(|v| v.get("convrot_groupsize")).and_then(|v| v.as_u64()).unwrap_or(256) as usize)
+                } else {
+                    None
+                };
+                let group_size = c.and_then(|v| v.get("group_size")).and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+                let s_name = if file.has(&format!("{prefix}.weight_s_channel")) {
+                    format!("{prefix}.weight_s_channel")
+                } else {
+                    format!("{prefix}.weight_scale")
+                };
+                let s = Held::small(file, &s_name, dev)?;
+                (QFormat::AmpereW4A8Preswizzled { convrot, group_size }, Some(s), None, None, wshape[1])
+            }
+            Some("w4a16") | Some("sym_w4a16") | Some("hyperflow_w4a16") => {
+                let c = conf.as_ref();
+                let convrot = if c.and_then(|v| v.get("convrot")).and_then(|v| v.as_bool()).unwrap_or(false) {
+                    Some(c.and_then(|v| v.get("convrot_groupsize")).and_then(|v| v.as_u64()).unwrap_or(256) as usize)
+                } else {
+                    None
+                };
+                let group_size = c.and_then(|v| v.get("group_size")).and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+                let s_name = if file.has(&format!("{prefix}.weight_scale")) {
+                    format!("{prefix}.weight_scale")
+                } else {
+                    format!("{prefix}.weight_scales")
+                };
+                let s = Held::small(file, &s_name, dev)?;
+                (QFormat::W4A16 { convrot, group_size }, Some(s), None, None, wshape[1] * 2)
+            }
             Some(f) => bail!("{prefix}: unsupported quantization format {f}"),
         };
-        let is_preswizzled = matches!(fmt, QFormat::AmpereW4A4Preswizzled { .. });
-        let out_features = if is_preswizzled { wshape[0] * 8 } else { wshape[0] };
+        let is_w4a4_preswizzled = matches!(fmt, QFormat::AmpereW4A4Preswizzled { .. });
+        let is_preswizzled = matches!(fmt, QFormat::AmpereW4A4Preswizzled { .. } | QFormat::AmpereW4A8Preswizzled { .. });
+        let out_features = if is_w4a4_preswizzled { wshape[0] * 8 } else { wshape[0] };
         let weight = if matches!(place, Placement::Ram | Placement::Disk) && is_preswizzled {
             Held::new_offloaded_stub(file, &wname)?
         } else {
@@ -775,7 +1019,7 @@ impl QLinear {
         }
         let mut l = self.clone();
         l.out_features = n;
-        if matches!(self.fmt, QFormat::Dense) {
+        if matches!(self.fmt, QFormat::Dense | QFormat::GgufQuant { .. }) {
             let w = self.weight.get(dev)?;
             let w_slice = w.narrow(0, r0, n)?.contiguous()?;
             l.weight = Held::from_tensor(w_slice);
@@ -821,6 +1065,9 @@ impl QLinear {
         let w = &raw.w;
         Ok(match &self.fmt {
             QFormat::Dense => w.to_dtype(dtype)?,
+            QFormat::GgufQuant { gtype } => {
+                kernels::dequant_gguf(w, *gtype, self.out_features, self.in_features, dtype)?
+            }
             QFormat::Int8 { .. } => kernels::dequant_i8(w, &self.scale.as_ref().unwrap().get(dev)?, dtype)?,
             QFormat::Nvfp4 => kernels::dequant_nvfp4(w, raw.bs.as_ref().unwrap(), &self.scale.as_ref().unwrap().get(dev)?, dtype)?,
             QFormat::AsymW4A8 { codebook, .. } => {
@@ -836,6 +1083,13 @@ impl QLinear {
             QFormat::AmpereW4A4Preswizzled { .. } => {
                 bail!("AmpereW4A4Preswizzled runs natively on INT4 Tensor Cores without dequantization");
             }
+            QFormat::AmpereW4A8Preswizzled { .. } => {
+                kernels::dequant_i8(w, &self.scale.as_ref().unwrap().get(dev)?, dtype)?
+            }
+            QFormat::W4A16 { .. } => {
+                let scale = self.scale.as_ref().unwrap().get(dev)?;
+                kernels::dequant_sym_w4a4(w, &scale, dtype)?
+            }
         })
     }
 
@@ -843,7 +1097,12 @@ impl QLinear {
     pub fn dequant_plain(&self, dev: &Device, dtype: DType) -> Result<Tensor> {
         let w = self.dequant(dev, DType::F32)?;
         let w = match &self.fmt {
-            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } | QFormat::AmpereW4A4Preswizzled { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
+            QFormat::Int8 { convrot: Some(g) }
+            | QFormat::AsymW4A8 { convrot: Some(g), .. }
+            | QFormat::SymW4A4 { convrot: Some(g), .. }
+            | QFormat::AmpereW4A4Preswizzled { convrot: Some(g), .. }
+            | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. }
+            | QFormat::W4A16 { convrot: Some(g), .. } => rotate_activation(&w, *g)?,
             _ => w,
         };
         Ok(w.to_dtype(dtype)?)
@@ -855,7 +1114,7 @@ impl QLinear {
         if x.device().is_metal() && matches!(self.fmt, QFormat::Int8 { .. }) && self.in_features % 64 == 0 {
             return self.forward_raw(x, &self.fetch(x.device())?, chunk);
         }
-        if x.device().is_cuda() && matches!(self.fmt, QFormat::AmpereW4A4Preswizzled { .. }) {
+        if x.device().is_cuda() && matches!(self.fmt, QFormat::AmpereW4A4Preswizzled { .. } | QFormat::AmpereW4A8Preswizzled { .. }) {
             return self.forward_raw(x, &self.fetch(x.device())?, chunk);
         }
         let w = self.dequant(x.device(), x.dtype())?;
@@ -867,7 +1126,16 @@ impl QLinear {
     }
 
     /// Apply with an already dequantized weight (see [`QLinear::dequant`]).
+    pub fn forward_chunked_to_device(&self, x: &Tensor, chunk: usize, dst_dev: &Device) -> Result<Tensor> {
+        let w = self.dequant(x.device(), x.dtype())?;
+        self.apply_to_device(x, &w, chunk, dst_dev)
+    }
+
     pub fn apply(&self, x: &Tensor, w: &Tensor, chunk: usize) -> Result<Tensor> {
+        self.apply_to_device(x, w, chunk, x.device())
+    }
+
+    pub fn apply_to_device(&self, x: &Tensor, w: &Tensor, chunk: usize, dst_dev: &Device) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let k = *dims.last().unwrap();
         let rows = x.elem_count() / k;
@@ -884,7 +1152,11 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
+                QFormat::Int8 { convrot: Some(g) }
+                | QFormat::AsymW4A8 { convrot: Some(g), .. }
+                | QFormat::SymW4A4 { convrot: Some(g), .. }
+                | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. }
+                | QFormat::W4A16 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
                 _ => xc.clone(),
             };
             let mut y = xr.matmul(&wt)?;
@@ -897,7 +1169,8 @@ impl QLinear {
                 let d = xc.matmul(&a.t()?)?.matmul(&b.t()?)?;
                 y = (y + (d * l.scale)?)?;
             }
-            outs.push(y);
+            let y_dst = if y.device().same_device(dst_dev) { y } else { y.to_device(dst_dev)? };
+            outs.push(y_dst);
             start += n;
         }
         let y = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
@@ -964,7 +1237,13 @@ impl QLinear {
             Ok(acc.unwrap())
         };
         match self.fmt {
-            QFormat::Nvfp4 | QFormat::AsymW4A8 { .. } | QFormat::SymW4A4 { .. } | QFormat::AmpereW4A4Preswizzled { .. } => return Ok(()), // keep the runtime path for nvfp4 and w4a8
+            QFormat::Nvfp4
+            | QFormat::AsymW4A8 { .. }
+            | QFormat::SymW4A4 { .. }
+            | QFormat::AmpereW4A4Preswizzled { .. }
+            | QFormat::AmpereW4A8Preswizzled { .. }
+            | QFormat::W4A16 { .. }
+            | QFormat::GgufQuant { .. } => return Ok(()),
             QFormat::Dense => {
                 let w = self.weight.get(dev)?;
                 let dt = w.dtype();
@@ -1096,6 +1375,7 @@ impl QLinear {
         }
         Ok(match &self.fmt {
             QFormat::AmpereW4A4Preswizzled { .. } if dev.is_cuda() => Prepared::W4A4(raw),
+            QFormat::AmpereW4A8Preswizzled { .. } if dev.is_cuda() => Prepared::Int8(raw),
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
             QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
                 let cb = codebook.get(dev)?;
@@ -1143,9 +1423,9 @@ impl QLinear {
                 let rows = x.elem_count() / k;
                 let x2 = x.reshape((rows, k))?;
                 let dev = x.device();
-                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
+                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
                 let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
-                    QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fuse => rotate_activation(&x2, g),
+                    QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. } if !fuse => rotate_activation(&x2, g),
                     _ => Ok(x2),
                 })?;
                 let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -1167,9 +1447,9 @@ impl QLinear {
         let rows = x.elem_count() / k;
         let x2 = x.reshape((rows, k))?;
         // the warp-level rotation is fused into the quantizer (group 256, K <= 56 groups)
-        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) } | QFormat::AsymW4A8 { convrot: Some(256), .. } | QFormat::SymW4A4 { convrot: Some(256), .. }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
+        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) } | QFormat::AsymW4A8 { convrot: Some(256), .. } | QFormat::SymW4A4 { convrot: Some(256), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(256), .. }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
         let xr = match self.fmt {
-            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
+            QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
             _ => x2,
         };
         let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -1236,9 +1516,9 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let dev = x.device();
-            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
+            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. } if kernels::can_fuse_rotation(k, g));
             let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } if !fuse => rotate_activation(&xc, g),
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. } if !fuse => rotate_activation(&xc, g),
                 _ => Ok(xc.clone()),
             })?;
             let mut y = crate::dit::prof::time("  int8 gemm", dev, || kernels::int8_linear_ex(&xr, &raw.w, &scale, self.bias.as_ref(), x.dtype(), false, fuse))?;
@@ -1277,7 +1557,7 @@ impl QLinear {
         for start in (0..rows).step_by(chunk.max(1)) {
             let xc = x2.narrow(0, start, chunk.max(1).min(rows-start))?;
             let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
+                QFormat::Int8 { convrot: Some(g) } | QFormat::AsymW4A8 { convrot: Some(g), .. } | QFormat::SymW4A4 { convrot: Some(g), .. } | QFormat::AmpereW4A8Preswizzled { convrot: Some(g), .. } => rotate_activation(&xc, g)?,
                 _ => xc.clone(),
             };
             let mut y = w.forward(&xr)?;

@@ -131,6 +131,11 @@ impl ContiguousPinnedBuffer {
     }
 
     #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
     pub fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
         assert!(len <= self.len);
         unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }

@@ -103,3 +103,8 @@ required-features = ["serve", "cuda"]
 name = "server_9412"
 path = "src/bin/server_9411.rs"
 required-features = ["serve", "cuda"]
+
+[[bin]]
+name = "server_5a"
+path = "src/bin/server_5a.rs"
+required-features = ["serve", "cuda"]
