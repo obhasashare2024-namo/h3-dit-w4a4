@@ -1358,10 +1358,16 @@ pub fn int8_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("H3_INT8").map(|v| v != "0").unwrap_or(true))
 }
 
+pub fn mmq_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("H3_MMQ").map(|v| v != "0").unwrap_or(true))
+}
+
 /// A weight ready for GEMMs: raw int8 (tensor-core path) or dequantized.
 pub enum Prepared {
     W4A4(Raw),
     Int8(Raw),
+    Mmq(Raw),
     #[cfg(feature = "mlx")]
     Mlx(crate::apple::Int8Weight),
     Deq(Tensor),
@@ -1377,6 +1383,9 @@ impl QLinear {
             QFormat::AmpereW4A4Preswizzled { .. } if dev.is_cuda() => Prepared::W4A4(raw),
             QFormat::AmpereW4A8Preswizzled { .. } if dev.is_cuda() => Prepared::Int8(raw),
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
+            QFormat::GgufQuant { gtype: GgmlType::Q3K } if mmq_enabled() && dev.is_cuda() && dtype == DType::BF16 => {
+                Prepared::Mmq(raw)
+            }
             QFormat::AsymW4A8 { codebook, .. } if int8_enabled() && dev.is_cuda() => {
                 let cb = codebook.get(dev)?;
                 let s_rel = raw.bs.as_ref().context("AsymW4A8 requires s_rel")?;
@@ -1396,6 +1405,7 @@ impl QLinear {
     pub fn run(&self, x: &Tensor, p: &Prepared, chunk: usize) -> Result<Tensor> {
         match p {
             Prepared::W4A4(raw) => self.apply_w4a4(x, raw, chunk),
+            Prepared::Mmq(raw) => self.apply_mmq(x, raw, chunk),
             Prepared::Deq(w) => self.apply(x, w, chunk),
             Prepared::Int8(raw) => self.apply_int8(x, raw, chunk),
             #[cfg(feature = "mlx")]
@@ -1416,6 +1426,10 @@ impl QLinear {
         match p {
             Prepared::W4A4(raw) => {
                 let y = self.apply_w4a4(x, raw, chunk)?;
+                crate::ops::swiglu(&y)
+            }
+            Prepared::Mmq(raw) => {
+                let y = self.apply_mmq(x, raw, chunk)?;
                 crate::ops::swiglu(&y)
             }
             Prepared::Int8(raw) if self.loras.is_empty() => {
@@ -1460,6 +1474,27 @@ impl QLinear {
     }
 
     
+    pub fn apply_mmq(&self, x: &Tensor, raw: &Raw, _chunk: usize) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let k = *dims.last().unwrap();
+        let rows = x.elem_count() / k;
+        let x2 = x.reshape((rows, k))?;
+
+        let dev = x.device();
+        let y = crate::dit::prof::time("  mmq_q3k gemm", dev, || {
+            kernels::mmq_q3_k(&x2, &raw.w, self.out_features, self.in_features)
+        })?;
+
+        let y = match &self.bias {
+            Some(b) => y.broadcast_add(&b.to_dtype(x.dtype())?)?,
+            None => y,
+        };
+
+        let mut od = dims;
+        *od.last_mut().unwrap() = self.out_features;
+        Ok(y.reshape(od)?)
+    }
+
     pub fn apply_w4a4(&self, x: &Tensor, raw: &Raw, chunk: usize) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let k = *dims.last().unwrap();
