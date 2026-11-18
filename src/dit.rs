@@ -1066,48 +1066,45 @@ impl Dit {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let (hg, w) = (h / groups, h / groups * d);
         let s = n1.dim(0)?;
-        println!("[attend_factorized] start: s={}, groups={}, w={}, chunk={}, free VRAM={:.2} GB", s, groups, w, chunk, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
-
         let inner = h * d;
-        let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
         let att_bytes_calc = s * inner * 2;
-        let offload_att = s > 140000 || (s > 30000 && free_vram_start < att_bytes_calc + 1_000_000_000);
-        let att_bytes = if !offload_att { att_bytes_calc } else { 0 };
-        let needed_mid_bytes = 3 * s * 768 * 2;
-        let offload_mid = s > 140000 || (s > 30000 && free_vram_start < needed_mid_bytes + att_bytes + 500_000_000);
+        let (offload_att, offload_mid) = if s > 30000 {
+            let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
+            let offload_att = s > 140000 || free_vram_start < att_bytes_calc + 1_000_000_000;
+            let att_bytes = if !offload_att { att_bytes_calc } else { 0 };
+            let needed_mid_bytes = 3 * s * 768 * 2;
+            let offload_mid = s > 140000 || free_vram_start < needed_mid_bytes + att_bytes + 500_000_000;
+            (offload_att, offload_mid)
+        } else {
+            (false, false)
+        };
         let (mid_q, mid_k, mid_v) = if offload_mid {
-            println!("[attend_factorized] offloading mid_q/k/v to CPU (s={}, free VRAM={:.2} GB, required={:.2} GB)", s, free_vram_start as f64 / 1e9, (needed_mid_bytes + att_bytes) as f64 / 1e9);
+            let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
+            log::info(&format!("[attend_factorized] offloading mid_q/k/v to CPU (s={}, free VRAM={:.2} GB)", s, free_vram_start as f64 / 1e9));
             let mid_q_cpu = prof::time("q down", &self.dev, || q.down.forward_chunked_to_device(&n1, chunk, &candle_core::Device::Cpu))?;
             let mid_k_cpu = prof::time("k down", &self.dev, || k.down.forward_chunked_to_device(&n1, chunk, &candle_core::Device::Cpu))?;
             let mid_v_cpu = prof::time("v down", &self.dev, || v.down.forward_chunked_to_device(&n1, chunk, &candle_core::Device::Cpu))?;
             drop(n1);
             let _ = self.dev.synchronize();
-            let (free_after_drop, _) = crate::config::vram_info().unwrap_or((0, 0));
-            println!("[attend_factorized] dropped n1, free VRAM restored to {:.2} GB, moving mid_q/k/v back to GPU", free_after_drop as f64 / 1e9);
             let mid_q = mid_q_cpu.to_device(&self.dev)?;
             let mid_k = mid_k_cpu.to_device(&self.dev)?;
             let mid_v = mid_v_cpu.to_device(&self.dev)?;
             (mid_q, mid_k, mid_v)
         } else {
-            println!("[attend_factorized] KEEPING mid_q/k/v ON GPU (Zero-Copy Fastpath), free VRAM={:.2} GB", free_vram_start as f64 / 1e9);
             let mid_q = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?;
             let mid_k = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?;
             let mid_v = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?;
             drop(n1);
-            let _ = self.dev.synchronize();
             (mid_q, mid_k, mid_v)
         };
-        println!("[attend_factorized] offload_att={} (s={})", offload_att, s);
 
         let pinned_att = if offload_att {
-            println!("[attend_factorized] Using Phase 3.3b Pinned Host Attention Buffer (Zero CPU Cat)");
             Some(crate::pinned_att::get_or_create_pinned_att(s, groups, w)?)
         } else {
             None
         };
 
         let att_full = if !offload_att {
-            println!("[attend_factorized] Preallocating att_full on GPU: [{}, {}]", s, inner);
             Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
         } else {
             None
@@ -1434,8 +1431,7 @@ impl Dit {
         let (h, d, hidden) = (self.cfg.heads, self.cfg.head_dim, self.cfg.hidden);
         let rot = cx.rope.dim(2)? * 2;
         let s_init = x.dim(0)?;
-        let (free_vram_rb, _) = crate::config::vram_info().unwrap_or((0, 0));
-        let chunk = if free_vram_rb < 2_500_000_000 && s_init > 80000 { 1024 } else { self.mem.token_chunk.max(4096) };
+        let chunk = if s_init > 80000 { 1024 } else { self.mem.token_chunk.max(4096) };
         let te = if cx.curve { cx.t_emb.clone() } else { ops::silu(cx.t_emb)?.to_dtype(self.dtype)? };
         let m = b.adaln.forward(&te)?.to_dtype(DType::F32)?; // [U, 6*hidden*3]
         let m = m.reshape((cx.u * 3, 6 * hidden))?;
@@ -1443,7 +1439,6 @@ impl Dit {
         let (shift_msa, scale_msa, gate_msa) = (c(0)?, c(1)?, c(2)?);
         let (shift_mlp, scale_mlp, gate_mlp) = (c(3)?, c(4)?, c(5)?);
 
-        let (free_vram_rb, _) = crate::config::vram_info().unwrap_or((0, 0));
         let groups = match &b.qkv {
             QkvProj::Fused(qkv) => self.attn_groups(x.dim(0)?, qkv),
             QkvProj::Factorized { .. } => {
@@ -1455,11 +1450,7 @@ impl Dit {
                     }
                 } else {
                     let tokens = x.dim(0)?;
-                    if free_vram_rb > 3_500_000_000 {
-                        if tokens > 140000 { 14 } else if tokens > 80000 { 14 } else if tokens > 30000 { 4 } else { 1 }
-                    } else {
-                        if tokens > 95000 { 28 } else if tokens > 65000 { 14 } else if tokens > 30000 { 4 } else { 1 }
-                    }
+                    if tokens > 140000 { 14 } else if tokens > 80000 { 14 } else if tokens > 30000 { 4 } else { 1 }
                 }
             }
         };
@@ -1718,10 +1709,8 @@ impl Dit {
                 r[0] = crate::weights::Raw { w: Tensor::zeros((1,), self.dtype, dev)?, bs: None };
                 r[1] = crate::weights::Raw { w: Tensor::zeros((1,), self.dtype, dev)?, bs: None };
             }
-            let (free_vram_mlp, _) = crate::config::vram_info().unwrap_or((0, 0));
-            println!("[dit] run_block: mlp start (IN-PLACE GPU RESIDUAL), free VRAM={:.2} GB", free_vram_mlp as f64 / 1e9);
             prof::time("mlp_inplace", dev, || -> Result<()> {
-                let mc = if free_vram_mlp < 2_500_000_000 && s > 80000 { 1024 } else { self.mem.mlp_chunk.max(4096) };
+                let mc = if s > 80000 { 1024 } else { self.mem.mlp_chunk.max(4096) };
                 match (&b.fc1, &b.fc2, &raws) {
                     (LinProj::Single(fc1), LinProj::Single(fc2), Some([_, _, r_fc1, r_fc2])) => {
                         let w1 = prof::time("dequant", dev, || fc1.prepare(r_fc1.clone(), dev, self.dtype))?;
@@ -1788,8 +1777,7 @@ impl Dit {
         let n2 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, cx.idx)?) })?;
         let (x_saved_mlp, mut x_holder_mlp) = (None::<Tensor>, Some(x));
 
-        let (free_vram_mlp, _) = crate::config::vram_info().unwrap_or((0, 0));
-        println!("[dit] run_block: mlp start, free VRAM={:.2} GB", free_vram_mlp as f64 / 1e9);
+
         let mo = prof::time("mlp", dev, || -> Result<Tensor> {
             match (&b.fc1, &b.fc2, &raws) {
                 (LinProj::Single(fc1), LinProj::Single(fc2), Some([_, _, r_fc1, r_fc2])) => {
