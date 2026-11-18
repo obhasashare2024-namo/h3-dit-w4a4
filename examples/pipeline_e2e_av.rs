@@ -30,9 +30,13 @@ struct Args {
     #[arg(long, default_value = "ram")]
     video_placement: String,
 
-    /// Weight storage placement for Audio VAE: 'ram' (system RAM, 0 VRAM until decode) or 'vram' (pinned in GPU VRAM)
-    #[arg(long, default_value = "ram")]
-    audio_placement: String,
+    /// Execution device for Audio VAE: 'cpu' (pure CPU host execution, 0 RTX 3070 VRAM) or 'cuda' (RTX 3070 GPU)
+    #[arg(long, default_value = "cpu")]
+    audio_device: String,
+
+    /// Execution device for Video VAE: 'cuda' (RTX 3070 GPU) or 'cpu' (pure CPU host execution)
+    #[arg(long, default_value = "cuda")]
+    video_device: String,
 
     /// Path to Video VAE weights
     #[arg(long, default_value = "/mnt/2tbnvS/models/vae/minimax_h3_video_vae_int8_convrot.safetensors")]
@@ -41,6 +45,14 @@ struct Args {
     /// Path to Audio VAE weights
     #[arg(long, default_value = "/mnt/R2D/models/minimax_h3_audio_vae_fp32.safetensors")]
     audio_vae: String,
+}
+
+fn parse_device(name: &str) -> Result<Device> {
+    match name.to_lowercase().as_str() {
+        "cuda" | "gpu" | "3070" | "vram" => Ok(Device::new_cuda(0)?),
+        "cpu" | "ram" | "host" => Ok(Device::Cpu),
+        other => bail!("Unknown device: {other}, expected 'cuda'/'3070' or 'cpu'/'ram'"),
+    }
 }
 
 fn parse_placement(name: &str) -> Result<Placement> {
@@ -84,24 +96,22 @@ fn main() -> Result<()> {
     println!("  Target Mode    : {}", args.target);
     println!("  Input Latent   : {}", args.input);
     println!("  Output Media   : {}", args.output);
-    println!("  Video Placement: {}", args.video_placement);
-    println!("  Audio Placement: {}", args.audio_placement);
+    println!("  Video Device   : {} (Placement: {})", args.video_device, args.video_placement);
+    println!("  Audio Device   : {} (Pure Host CPU / 0 VRAM Contention)", args.audio_device);
     println!("========================================================");
 
-    let gpu_dev = Device::new_cuda(0)?;
-    let cpu_dev = Device::Cpu;
-
+    let v_dev = parse_device(&args.video_device)?;
+    let a_dev = parse_device(&args.audio_device)?;
     let v_place = parse_placement(&args.video_placement)?;
-    let a_place = parse_placement(&args.audio_placement)?;
 
     // 1. Read input latents
     println!("[1] Reading multi-modal denoised latents: {}...", args.input);
     let mut f = File::open(&args.input).context("open edlat")?;
 
-    let zv = read_h3lt_tensor(&mut f, &cpu_dev)?;
+    let zv = read_h3lt_tensor(&mut f, &Device::Cpu)?;
     println!("    Video latent shape: {:?}, dtype: {:?}", zv.dims(), zv.dtype());
 
-    let za_res = read_h3lt_tensor(&mut f, &cpu_dev);
+    let za_res = read_h3lt_tensor(&mut f, &Device::Cpu);
     let za = match za_res {
         Ok(t) => {
             println!("    Audio latent shape: {:?}, dtype: {:?}", t.dims(), t.dtype());
@@ -126,24 +136,16 @@ fn main() -> Result<()> {
             Some(t) => t,
             None => bail!("Cannot run audio-only mode: no audio latent in input edlat"),
         };
-        let a_load_dev = if matches!(a_place, Placement::Ram) { &cpu_dev } else { &gpu_dev };
-        println!("
-[Audio Pipeline] Loading Audio VAE (Placement: {:?}) from {}...", a_place, args.audio_vae);
+        println!("\n[Audio Pipeline] Loading Audio VAE to {} from {}...", args.audio_device, args.audio_vae);
         let t_aload = Instant::now();
-        let a_vae = AudioVae::load(&args.audio_vae, a_load_dev)?;
+        let a_vae = AudioVae::load(&args.audio_vae, &a_dev)?;
         println!("    Audio VAE loaded in {:.2}s (sample rate: {} Hz)", t_aload.elapsed().as_secs_f64(), a_vae.sample_rate);
 
-        println!("[Audio Pipeline] Decoding audio waveform (BigVGAN)...");
+        println!("[Audio Pipeline] Decoding audio waveform (BigVGAN) on {}...", args.audio_device);
         let t_adec = Instant::now();
-        let a_vae_active = if matches!(a_place, Placement::Ram) {
-            println!("    Streaming Audio VAE weights RAM -> GPU for execution...");
-            a_vae.to_device(&gpu_dev)?
-        } else {
-            a_vae
-        };
-        let wave = a_vae_active.decode(&za_tensor.to_device(&gpu_dev)?)?;
-        let sr = a_vae_active.sample_rate;
-        println!("    Audio decoded in {:.2}s, waveform shape: {:?}", t_adec.elapsed().as_secs_f64(), wave.dims());
+        let wave = a_vae.decode(&za_tensor.to_device(&a_dev)?)?;
+        let sr = a_vae.sample_rate;
+        println!("    Audio decoded in {:.2}s on {}, waveform shape: {:?}", t_adec.elapsed().as_secs_f64(), args.audio_device, wave.dims());
 
         let wav_path = if args.output.ends_with(".wav") {
             args.output.clone()
@@ -152,12 +154,12 @@ fn main() -> Result<()> {
         };
         write_wav(&wav_path, &wave, sr)?;
         println!("\n🎉 Audio-Only Render Finished Successfully!");
-        println!("   Output WAV: {wav_path} (No Video VAE loaded, 0 video VRAM used)");
+        println!("   Output WAV: {} (Device: {}, 0 RTX 3070 VRAM used)", wav_path, args.audio_device);
         return Ok(());
     }
 
     // Video pipeline (either 'video' or 'both')
-    println!("\n[Video Pipeline] Loading Video VAE (Placement: {:?}) from {}...", v_place, args.video_vae);
+    println!("\n[Video Pipeline] Loading Video VAE (Device: {}, Placement: {:?}) from {}...", args.video_device, v_place, args.video_vae);
     let mut mem = MemoryConfig::default();
     mem.vae_resident = matches!(v_place, Placement::Gpu);
     mem.offload = v_place;
@@ -165,11 +167,11 @@ fn main() -> Result<()> {
     mem.vae_dtype = "f16".into();
 
     let t_vload = Instant::now();
-    let v_vae = VideoVae::load(&args.video_vae, &gpu_dev, &mem)?;
+    let v_vae = VideoVae::load(&args.video_vae, &v_dev, &mem)?;
     println!("    Video VAE loaded in {:.2}s", t_vload.elapsed().as_secs_f64());
 
-    println!("[Video Pipeline] Decoding Video latents to RGB pixels...");
-    let zv_target = zv.to_device(&gpu_dev)?;
+    println!("[Video Pipeline] Decoding Video latents to RGB pixels on {}...", args.video_device);
+    let zv_target = zv.to_device(&v_dev)?;
     let t_vdec = Instant::now();
     let px = v_vae.decode(&zv_target)?;
     println!("    Video decoded in {:.2}s, raw shape: {:?}", t_vdec.elapsed().as_secs_f64(), px.dims());
@@ -181,24 +183,16 @@ fn main() -> Result<()> {
     let mut audio_tuple: Option<(Tensor, u32)> = None;
     if args.target == "both" {
         if let Some(za_tensor) = za {
-            let a_load_dev = if matches!(a_place, Placement::Ram) { &cpu_dev } else { &gpu_dev };
-            println!("
-[Audio Pipeline] Loading Audio VAE (Placement: {:?}) from {}...", a_place, args.audio_vae);
+            println!("\n[Audio Pipeline] Loading Audio VAE to {} from {}...", args.audio_device, args.audio_vae);
             let t_aload = Instant::now();
-            let a_vae = AudioVae::load(&args.audio_vae, a_load_dev)?;
+            let a_vae = AudioVae::load(&args.audio_vae, &a_dev)?;
             println!("    Audio VAE loaded in {:.2}s (sample rate: {} Hz)", t_aload.elapsed().as_secs_f64(), a_vae.sample_rate);
 
-            println!("[Audio Pipeline] Decoding Audio waveform (BigVGAN)...");
+            println!("[Audio Pipeline] Decoding Audio waveform (BigVGAN) on {}...", args.audio_device);
             let t_adec = Instant::now();
-            let a_vae_active = if matches!(a_place, Placement::Ram) {
-                println!("    Streaming Audio VAE weights RAM -> GPU for execution...");
-                a_vae.to_device(&gpu_dev)?
-            } else {
-                a_vae
-            };
-            let wave = a_vae_active.decode(&za_tensor.to_device(&gpu_dev)?)?;
-            let sr = a_vae_active.sample_rate;
-            println!("    Audio decoded in {:.2}s, waveform shape: {:?}", t_adec.elapsed().as_secs_f64(), wave.dims());
+            let wave = a_vae.decode(&za_tensor.to_device(&a_dev)?)?;
+            let sr = a_vae.sample_rate;
+            println!("    Audio decoded in {:.2}s on {}, waveform shape: {:?}", t_adec.elapsed().as_secs_f64(), args.audio_device, wave.dims());
 
             let expected_samples = ((num_frames as f64 / 24.0) * sr as f64).round() as usize;
             let wave_trimmed = wave.narrow(1, 0, expected_samples.min(wave.dim(1)?))?;
@@ -214,8 +208,7 @@ fn main() -> Result<()> {
     } else {
         args.output.clone()
     };
-    println!("
-[Muxing] Generating MP4: {}...", out_mp4);
+    println!("\n[Muxing] Generating MP4: {}...", out_mp4);
     let t_mux = Instant::now();
     let audio_arg = audio_tuple.as_ref().map(|(w, sr)| (w, *sr));
     write_mp4(&out_mp4, &frames, 24.0, audio_arg, 23)?;

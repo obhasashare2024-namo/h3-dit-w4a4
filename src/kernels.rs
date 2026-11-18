@@ -2279,8 +2279,14 @@ impl CustomOp1 for Act1d {
     }
 }
 
+#[path = "portable/kernels.rs"]
+mod cpu_kernels;
+
 /// BigVGAN `Activation1d(SnakeBeta)`: `[B, C, L]` f32, filters `[12]`, log alpha/beta `[C]`.
 pub fn act1d(x: &Tensor, up_filter: &Tensor, down_filter: &Tensor, log_alpha: &Tensor, log_beta: &Tensor) -> Result<Tensor> {
+    if !x.device().is_cuda() {
+        return cpu_kernels::act1d(x, up_filter, down_filter, log_alpha, log_beta);
+    }
     let f = |t: &Tensor| t.to_dtype(DType::F32)?.flatten_all()?.contiguous();
     let op = Act1d { fu: f(up_filter)?, fd: f(down_filter)?, la: f(log_alpha)?, lb: f(log_beta)? };
     x.to_dtype(DType::F32)?.contiguous()?.apply_op1_no_bwd(&op)
