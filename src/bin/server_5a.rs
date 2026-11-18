@@ -225,7 +225,14 @@ fn worker_loop(
             f.read_exact(&mut kf_idx_bytes)?;
             let kf_idx = i32::from_le_bytes(kf_idx_bytes) as usize;
 
-            let token_tags_vec: Vec<u32> = token_tags_t.to_vec1::<f32>()?.iter().map(|&x| x as u32).collect();
+            let token_tags_vec: Vec<u32> = token_tags_t.to_vec1::<f32>()?.iter().map(|&x| {
+                if x > 0.0 && x < 1e-30 {
+                    x.to_bits()
+                } else {
+                    x as u32
+                }
+            }).collect();
+            println!("[server_5a] Decoded {} token tags (first 10: {:?})", token_tags_vec.len(), &token_tags_vec[..10.min(token_tags_vec.len())]);
 
             let cond = DitCond {
                 text: context,
@@ -243,18 +250,36 @@ fn worker_loop(
                 control: None,
             };
 
-            let video_shape = vid_lat.dims();
+            let video_shape = vid_lat.dims().to_vec();
             let audio_t = aud_lat.dim(3)?;
             let sigmas = simple_sigmas(shifts[0] as f64, req.steps);
 
-            let run = dit.prepare(&cond, video_shape, audio_t, sigmas.clone())?;
+            // Step 0 Gaussian Noise Initialization:
+            let (xv, xa) = {
+                let vid_data = vid_lat.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let is_empty = vid_data.iter().all(|&x| x == 0.0);
+                if is_empty {
+                    println!("[server_5a] Input latent is empty/zero -> Initializing ComfyUI-matching TorchGen noise with seed {}", req.seed);
+                    let mut gen = h3_rs::rng::TorchGen::new(req.seed);
+                    let nv = gen.randn_tensor(&video_shape, &dev)?;
+                    let na = gen.randn_tensor(&[1, 32, 2, audio_t], &dev)?;
+                    let xv = (&nv * sigmas[0])?;
+                    let xa = (&na * sigmas[0])?;
+                    (xv, xa)
+                } else {
+                    println!("[server_5a] Input latent contains existing data -> using input latent directly");
+                    (vid_lat, aud_lat)
+                }
+            };
+
+            let run = dit.prepare(&cond, &video_shape, audio_t, sigmas.clone())?;
 
             let mut last_t = Instant::now();
             let sampled = sample_denoised(
                 &dit,
                 &run,
-                vid_lat,
-                aud_lat,
+                xv,
+                xa,
                 &sigmas,
                 Sampler::Euler,
                 None,
