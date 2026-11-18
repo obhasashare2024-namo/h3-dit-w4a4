@@ -34,19 +34,30 @@ fn read_h3lt_tensor<R: Read>(r: &mut R, dev: &Device) -> Result<Tensor> {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let edlat_path = if args.len() > 1 {
+        args[1].clone()
+    } else {
+        "/mnt/R2D/tmp/minimax_bridge/stage2_denoised_1080p_3s.edlat".to_string()
+    };
+    let out_mp4 = if args.len() > 2 {
+        args[2].clone()
+    } else {
+        "/mnt/2tbnvS/tmp/h3_render_1080p_3s_noaudio.mp4".to_string()
+    };
+
     println!("========================================================");
-    println!("  MiniMax H3 Pure Rust 3s Real Video Render from .edlat ");
+    println!("  MiniMax H3 Pure Rust Video Render from .edlat         ");
     println!("========================================================");
     let dev = Device::new_cuda(0)?;
 
-    let edlat_path = "/mnt/2tbnvS/minimax_dit_native_archive/cpp_baseline/stage2_denoised_cpp_3s.edlat";
-    println!("[1] Reading 3s denoised latent: {edlat_path}...");
-    let mut f = File::open(edlat_path).context("open edlat")?;
+    println!("[1] Reading denoised latent: {edlat_path}...");
+    let mut f = File::open(&edlat_path).context("open edlat")?;
     let z = read_h3lt_tensor(&mut f, &dev)?;
     println!("    Latent shape: {:?}, dtype: {:?}", z.dims(), z.dtype());
 
     // 2. Configure VAE for 8GB GPU (streaming blocks to save VRAM)
-    let vae_path = "/mnt/R2D/models/minimax_h3_video_vae_fp16.safetensors";
+    let vae_path = if args.len() > 3 { args[3].clone() } else { "/mnt/2tbnvS/models/vae/minimax_h3_video_vae_int8_convrot.safetensors".to_string() };
     println!("[2] Loading Video VAE from: {vae_path}...");
     let mut mem = MemoryConfig::default();
     mem.vae_resident = false;      // stream blocks from host to ensure 0 VRAM blowout
@@ -55,7 +66,7 @@ fn main() -> Result<()> {
     mem.offload = h3_rs::weights::Placement::Ram;
 
     let t0 = Instant::now();
-    let vae = VideoVae::load(vae_path, &dev, &mem)?;
+    let vae = VideoVae::load(&vae_path, &dev, &mem)?;
     println!("    Video VAE loaded in {:.2}s", t0.elapsed().as_secs_f64());
 
     // 3. Decode latents to video pixels
@@ -70,13 +81,12 @@ fn main() -> Result<()> {
     println!("    Rendered video: {num_frames} frames, {w}x{h}, {c} channels");
 
     // 5. Write to MP4 via ffmpeg (zero audio)
-    let out_mp4 = "/mnt/2tbnvS/tmp/h3_3s_video_rendered_noaudio.mp4";
     println!("[4] Muxing pure video to MP4 (no audio): {out_mp4}...");
     let t_mux = Instant::now();
-    write_mp4(out_mp4, &frames, 24.0, None, 23)?;
+    write_mp4(&out_mp4, &frames, 24.0, None, 23)?;
     println!("    MP4 muxed successfully in {:.2}s!", t_mux.elapsed().as_secs_f64());
 
-    println!("\n🎉 Pure Rust 3s Video Render Finished Successfully!");
+    println!("\n🎉 Pure Rust Video Render Finished Successfully!");
     println!("   Output File: {out_mp4}");
     Ok(())
 }

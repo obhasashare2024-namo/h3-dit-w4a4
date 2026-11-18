@@ -102,7 +102,7 @@ impl VideoVae {
             }
             let mut pq = QLinear::load(&f, "post_quant_conv", Placement::Gpu, dev, DType::F32)?;
             let w = f.load_as("post_quant_conv.weight", dev, DType::F32)?;
-            pq.weight = crate::weights::Held::from_tensor(w.reshape((w.dim(0)?, w.dim(1)?))?);
+            pq.weight = crate::weights::Held::from_tensor(w.reshape((24, 24))?); pq.out_features = 24; pq.in_features = 24;
             Some(Decoder {
                 x_embedder: QLinear::load(&f, "decoder.x_embedder", Placement::Gpu, dev, dtype)?,
                 register_tokens: ld("decoder.register_tokens")?,
@@ -115,14 +115,14 @@ impl VideoVae {
             None
         };
         let enc = if f.has("encoder.conv_in.weight") { Some(load_encoder(&f, dev)?) } else { None };
-        let stats = |n: &str| -> Result<Tensor> { Ok(f.load_as(n, dev, DType::F32)?.reshape((1, 24, 1, 1, 1))?) };
+        let stats = |n: &str, def_val: f32| -> Result<Tensor> { if f.has(n) { Ok(f.load_as(n, dev, DType::F32)?.reshape((1, 24, 1, 1, 1))?) } else { Ok(Tensor::full(def_val, (1, 24, 1, 1, 1), dev)?) } };
         log::info(&format!(
             "video VAE: decoder {n_layers} layers ({:?}, {}), encoder {}",
             dtype,
             if mem.vae_resident { "resident" } else { "streamed" },
             enc.is_some()
         ));
-        Ok(Self { dev: dev.clone(), dtype, tile_batch: mem.vae_tile_batch.max(1), dec, enc, mean: stats("latents_mean")?, std: stats("latents_std")? })
+        Ok(Self { dev: dev.clone(), dtype, tile_batch: mem.vae_tile_batch.max(1), dec, enc, mean: stats("latents_mean", 0.0)?, std: stats("latents_std", 1.0)? })
     }
 
     // ------------------------------------------------------------------------------------------

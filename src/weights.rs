@@ -351,7 +351,7 @@ fn parse_gguf(mmap: &[u8]) -> Result<(usize, HashMap<String, TensorInfo>, HashMa
             t => bail!("unsupported gguf tensor type {t}"),
         };
 
-        let k = name.strip_prefix("model.diffusion_model.").map(str::to_string).unwrap_or(name);
+        let name_stripped = name.strip_prefix("model.diffusion_model.").unwrap_or(&name); let k = name_stripped.strip_prefix("first_stage_model.").map(str::to_string).unwrap_or_else(|| name_stripped.to_string());
         tensors.insert(k, TensorInfo {
             dtype: dtype_str,
             shape: dims,
@@ -459,7 +459,7 @@ impl SafeFile {
 
     /// Load and convert to `dtype` (float tensors only).
     pub fn load_as(&self, name: &str, dev: &Device, dtype: DType) -> Result<Tensor> {
-        Ok(self.load(name, dev)?.to_dtype(dtype)?)
+        let info = self.info(name)?; if let Some(gt) = GgmlType::from_tag(&info.dtype) { let raw = self.load(name, dev)?; let rows = info.shape[0]; let cols = if info.shape.len() > 1 { info.shape[1] } else { 1 }; Ok(crate::kernels::dequant_gguf(&raw, gt, rows, cols, dtype)?) } else { Ok(self.load(name, dev)?.to_dtype(dtype)?) }
     }
 
     #[inline]
