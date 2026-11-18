@@ -889,8 +889,10 @@ void ampere_w4a4_group256_gemm_sm86(
 
             #pragma unroll
             for (int mi = 0; mi < 2; ++mi) {
-                int a_row = (warp_m_idx << 5) + (mi << 4) + (lane_id & 15);
-                int a_col = (k_step << 3) + ((lane_id >> 2) & 4);
+                int grp = lane_id >> 3;
+                int tid8 = lane_id & 7;
+                int a_row = (warp_m_idx << 5) + (mi << 4) + ((grp & 1) << 3) + tid8;
+                int a_col = (k_step << 3) + ((grp >> 1) << 2);
                 ptx_ldmatrix_x4(reg_a[mi], &s_A[a_row][a_col]);
             }
 
