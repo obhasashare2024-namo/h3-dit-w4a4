@@ -300,6 +300,86 @@ fn worker_loop(
     }
 }
 
+
+#[derive(Deserialize, Debug)]
+struct RenderReq {
+    #[serde(default = "default_render_input")]
+    input_path: String,
+    #[serde(default = "default_render_output")]
+    output_path: String,
+    #[serde(default = "default_render_target")]
+    target: String,
+    #[serde(default = "default_render_video_placement")]
+    video_placement: String,
+    #[serde(default = "default_render_audio_device")]
+    audio_device: String,
+}
+
+fn default_render_input() -> String {
+    "/mnt/R2D/tmp/minimax_bridge/stage2_denoised_w4a4_9412_3s.edlat".to_string()
+}
+fn default_render_output() -> String {
+    "/mnt/2tbnvS/tmp/h3_server_rendered_output.mp4".to_string()
+}
+fn default_render_target() -> String {
+    "both".to_string()
+}
+fn default_render_video_placement() -> String {
+    "ram".to_string()
+}
+fn default_render_audio_device() -> String {
+    "cpu".to_string()
+}
+
+async fn handle_render(body: Bytes) -> HttpResponse {
+    let req: RenderReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::BadRequest().json(&serde_json::json!({"error": format!("Invalid JSON: {e}")})),
+    };
+    let t0 = Instant::now();
+    let bin_path = "/mnt/2tbnvS/h3-rs/target/release/examples/pipeline_e2e_av";
+    let (reply, rx) = oneshot::channel();
+    let r_clone = (req.target.clone(), req.input_path.clone(), req.output_path.clone(), req.video_placement.clone(), req.audio_device.clone());
+    std::thread::spawn(move || {
+        let (target, input, output, v_place, a_dev) = r_clone;
+        let out = std::process::Command::new(bin_path)
+            .arg("--target").arg(target)
+            .arg("--input").arg(input)
+            .arg("--output").arg(output)
+            .arg("--video-placement").arg(v_place)
+            .arg("--audio-device").arg(a_dev)
+            .output();
+        let _ = reply.send(out);
+    });
+
+    match rx.await {
+        Ok(Ok(out)) => {
+            let elapsed = t0.elapsed().as_secs_f64();
+            if out.status.success() {
+                let f_size = std::fs::metadata(&req.output_path).map(|m| m.len()).unwrap_or(0);
+                HttpResponse::Ok().json(&serde_json::json!({
+                    "status": "success",
+                    "output_path": req.output_path,
+                    "file_size": f_size,
+                    "target": req.target,
+                    "elapsed_seconds": (elapsed * 100.0).round() / 100.0,
+                    "stdout": String::from_utf8_lossy(&out.stdout).to_string(),
+                }))
+            } else {
+                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
+                HttpResponse::InternalServerError().json(&serde_json::json!({
+                    "status": "error",
+                    "stderr": err_str,
+                    "stdout": out_str,
+                }))
+            }
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(&serde_json::json!({"error": format!("Command failed: {e}")})),
+        Err(_) => HttpResponse::ServiceUnavailable().json(&serde_json::json!({"error": "Render thread canceled"})),
+    }
+}
+
 async fn handle_sample(tx: std_mpsc::Sender<SampleJob>, body: Bytes) -> HttpResponse {
     let req: SampleReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -349,6 +429,7 @@ async fn main() -> std::io::Result<()> {
                 }))
             }))
             .service(web::resource("/sample").route(web::post().to(move |body: Bytes| handle_sample(tx.clone(), body))))
+            .service(web::resource("/render").route(web::post().to(handle_render)))
     })
     .bind(addr.as_str(), ntex::SharedCfg::new("server_5a"))?
     .workers(1)
