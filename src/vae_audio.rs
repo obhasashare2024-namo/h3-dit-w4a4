@@ -23,6 +23,14 @@ impl Act {
     fn fwd(&self, x: &Tensor) -> Result<Tensor> {
         Ok(kernels::act1d(x, &self.up, &self.down, &self.alpha, &self.beta)?)
     }
+    fn to_device(&self, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            up: self.up.to_device(dev)?,
+            down: self.down.to_device(dev)?,
+            alpha: self.alpha.to_device(dev)?,
+            beta: self.beta.to_device(dev)?,
+        })
+    }
 }
 
 struct Conv1 {
@@ -46,12 +54,32 @@ impl Conv1 {
             None => y,
         })
     }
+    fn to_device(&self, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            w: self.w.to_device(dev)?,
+            b: match &self.b {
+                Some(b) => Some(b.to_device(dev)?),
+                None => None,
+            },
+            pad: self.pad,
+            dil: self.dil,
+        })
+    }
 }
 
 struct AmpBlock {
     convs1: Vec<Conv1>,
     convs2: Vec<Conv1>,
     acts: Vec<Act>,
+}
+
+impl AmpBlock {
+    fn to_device(&self, dev: &Device) -> Result<Self> {
+        let convs1 = self.convs1.iter().map(|c| c.to_device(dev)).collect::<Result<Vec<_>>>()?;
+        let convs2 = self.convs2.iter().map(|c| c.to_device(dev)).collect::<Result<Vec<_>>>()?;
+        let acts = self.acts.iter().map(|a| a.to_device(dev)).collect::<Result<Vec<_>>>()?;
+        Ok(Self { convs1, convs2, acts })
+    }
 }
 
 pub struct AudioVae {
@@ -105,6 +133,26 @@ impl AudioVae {
             act_post: Act::load(&f, "decoder.activation_post", dev)?,
             conv_post: Conv1::load(&f, "decoder.conv_post", dev, 1)?,
             sample_rate: sr,
+        })
+    }
+
+    pub fn to_device(&self, dev: &Device) -> Result<Self> {
+        let mut ups = Vec::with_capacity(self.ups.len());
+        for (w, b, stride, pad) in &self.ups {
+            ups.push((w.to_device(dev)?, b.to_device(dev)?, *stride, *pad));
+        }
+        let res = self.res.iter().map(|b| b.to_device(dev)).collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            dev: dev.clone(),
+            mean: self.mean.to_device(dev)?,
+            std: self.std.to_device(dev)?,
+            dec_in: self.dec_in.to_device(dev)?,
+            conv_pre: self.conv_pre.to_device(dev)?,
+            ups,
+            res,
+            act_post: self.act_post.to_device(dev)?,
+            conv_post: self.conv_post.to_device(dev)?,
+            sample_rate: self.sample_rate,
         })
     }
 
