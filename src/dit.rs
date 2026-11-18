@@ -456,6 +456,9 @@ pub struct Dit {
     condition_proj: QLinear,
     adaln_t_table: Option<Tensor>,
     time_embedder: Option<(QLinear, QLinear)>,
+    pub endpoint_time_embedder: Option<(QLinear, QLinear)>,
+    pub hyperflow_gate: Option<f32>,
+    pub hyperflow_sigmas: Option<Vec<f64>>,
     inv_freq: Tensor,
     refiner: Vec<RefinerBlock>,
     refiner_norm: Tensor,
@@ -770,6 +773,27 @@ impl Dit {
         } else {
             (None, Some((dense_f32(&f, "time_embedder.proj_in", dev)?, dense_f32(&f, "time_embedder.proj_out", dev)?)))
         };
+        let endpoint_time_embedder = if f.has("endpoint_time_embedder.proj_in.weight") {
+            log::info("loading endpoint_time_embedder for HyperFlow Two-Time distillation");
+            Some((dense_f32(&f, "endpoint_time_embedder.proj_in", dev)?, dense_f32(&f, "endpoint_time_embedder.proj_out", dev)?))
+        } else {
+            None
+        };
+        let hyperflow_gate = if f.has("hyperflow_gate") {
+            let g = f.load_as("hyperflow_gate", &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0];
+            log::info(&format!("loaded HyperFlow gate: {g}"));
+            Some(g)
+        } else {
+            None
+        };
+        let hyperflow_sigmas = if f.has("hyperflow_sigmas") {
+            let sig_t = f.load_as("hyperflow_sigmas", &Device::Cpu, DType::F32)?;
+            let sig: Vec<f64> = sig_t.flatten_all()?.to_vec1::<f32>()?.iter().map(|&x| x as f64).collect();
+            log::info(&format!("loaded HyperFlow sigmas: {:?}", sig));
+            Some(sig)
+        } else {
+            None
+        };
         let mut dit = Self {
             dev: dev.clone(),
             dtype,
@@ -779,6 +803,9 @@ impl Dit {
             condition_proj: QLinear::load(&f, "condition_proj", Placement::Gpu, dev, dtype)?,
             adaln_t_table,
             time_embedder,
+            endpoint_time_embedder,
+            hyperflow_gate,
+            hyperflow_sigmas,
             inv_freq: ld(&f, "rope.inv_freq", dev, DType::F32)?,
             refiner,
             refiner_norm: ld(&f, "token_refiner.final_norm.weight", dev, dtype)?,
@@ -1859,8 +1886,18 @@ impl Dit {
         Ok(x)
     }
 
-    fn time_embed(&self, t_vals: &[f64]) -> Result<Tensor> {
+    fn eval_embedder(&self, t_vals: &[f64], pin: &QLinear, pout: &QLinear) -> Result<Tensor> {
         let t = Tensor::from_vec(t_vals.iter().map(|v| *v as f32).collect::<Vec<_>>(), t_vals.len(), &self.dev)?;
+        let half = self.cfg.timestep_input_dim / 2;
+        let freqs: Vec<f32> = (0..half).map(|i| (-(10000f32.ln()) * i as f32 / half as f32).exp()).collect();
+        let freqs = Tensor::from_vec(freqs, (1, half), &self.dev)?;
+        let args = t.unsqueeze(1)?.broadcast_mul(&freqs)?;
+        let emb = Tensor::cat(&[args.cos()?, args.sin()?], 1)?;
+        let h = ops::silu(&pin.forward(&emb)?)?;
+        Ok(pout.forward(&h)?.to_dtype(self.dtype)?.to_dtype(DType::F32)?)
+    }
+
+    fn time_embed(&self, t_vals: &[f64], r_vals: Option<&[f64]>) -> Result<Tensor> {
         if let Some(table) = &self.adaln_t_table {
             let g = table.dim(0)?;
             let mut i0 = vec![];
@@ -1878,13 +1915,15 @@ impl Dit {
             return Ok((&a + (b - &a)?.broadcast_mul(&w)?)?);
         }
         let (pin, pout) = self.time_embedder.as_ref().unwrap();
-        let half = self.cfg.timestep_input_dim / 2;
-        let freqs: Vec<f32> = (0..half).map(|i| (-(10000f32.ln()) * i as f32 / half as f32).exp()).collect();
-        let freqs = Tensor::from_vec(freqs, (1, half), &self.dev)?;
-        let args = t.unsqueeze(1)?.broadcast_mul(&freqs)?;
-        let emb = Tensor::cat(&[args.cos()?, args.sin()?], 1)?;
-        let h = ops::silu(&pin.forward(&emb)?)?;
-        Ok(pout.forward(&h)?.to_dtype(self.dtype)?.to_dtype(DType::F32)?)
+        let cur = self.eval_embedder(t_vals, pin, pout)?;
+        if let (Some((epin, epout)), Some(gate), Some(r)) = (&self.endpoint_time_embedder, self.hyperflow_gate, r_vals) {
+            let endp = self.eval_embedder(r, epin, epout)?;
+            let diff = (&endp - &cur)?;
+            let gate_f = gate as f64;
+            Ok((&cur + (&diff * gate_f)?)?)
+        } else {
+            Ok(cur)
+        }
     }
 
     /// One model evaluation. `x_audio` is the sampler's carried audio (scaled onto the video
@@ -1908,8 +1947,48 @@ impl Dit {
         let xv = x_video.to_dtype(DType::F32)?;
         let xv = if oh % 2 != 0 || ow % 2 != 0 { xv.pad_with_same(3, 0, oh % 2)?.pad_with_same(4, 0, ow % 2)? } else { xv };
         let layout = &run.layout;
-        let t_v = 1.0 - sigma_v;
-        let t_a = 1.0 - sigma_a;
+
+        let (sv, sa) = (self.cfg.shift_video, self.cfg.shift_audio);
+        let sigma_next = if !run.sample_sigmas.is_empty() {
+            let schedule = &run.sample_sigmas;
+            let mut best_idx = 0;
+            let mut best_diff = (schedule[0] - sigma_v).abs();
+            for (idx, &s) in schedule.iter().enumerate() {
+                let diff = (s - sigma_v).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_idx = idx;
+                }
+            }
+            let next_idx = (best_idx + 1).min(schedule.len() - 1);
+            schedule[next_idx]
+        } else if let Some(schedule) = &self.hyperflow_sigmas {
+            let mut best_idx = 0;
+            let mut best_diff = (schedule[0] - sigma_v).abs();
+            for (idx, &s) in schedule.iter().enumerate() {
+                let diff = (s - sigma_v).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_idx = idx;
+                }
+            }
+            let next_idx = (best_idx + 1).min(schedule.len() - 1);
+            schedule[next_idx]
+        } else {
+            sigma_v
+        };
+
+        let t_video = 1.0 - sigma_v;
+        let r_video = 1.0 - sigma_next;
+        let r_audio = 1.0 - time_shift_sigma(sigma_next, sv, sa);
+        let mut t_audio = 1.0 - time_shift_sigma(sigma_v, sv, sa);
+        let collide = (t_video as f32 == t_audio as f32) && (r_video != r_audio);
+        if collide {
+            t_audio = 1.0 - (time_shift_sigma(sigma_v, sv, sa) - 1e-6);
+        }
+
+        let t_v = t_video;
+        let t_a = t_audio;
         let seg_t = |k: Seg| -> f64 {
             match k {
                 Seg::Text | Seg::Video => t_v,
@@ -2037,7 +2116,21 @@ impl Dit {
         let pristine = ctrl.map(|_| x.clone());
         let mut cstream: Option<Tensor> = None;
 
-        let t_emb = self.time_embed(&unique)?; // [U, t_dim] f32
+        let r_vals: Option<Vec<f64>> = if self.endpoint_time_embedder.is_some() {
+            Some(unique.iter().map(|&t| {
+                if (t as f32) == (t_video as f32) {
+                    r_video
+                } else if (t as f32) == (t_audio as f32) {
+                    r_audio
+                } else {
+                    t
+                }
+            }).collect())
+        } else {
+            None
+        };
+
+        let t_emb = self.time_embed(&unique, r_vals.as_deref())?; // [U, t_dim] f32
         let curve = self.adaln_t_table.is_some();
         let hidden = self.cfg.hidden;
         let cx = StepCtx { t_emb: &t_emb, curve, idx: &idx, rope: &run.rope, u: unique.len() };
@@ -2056,6 +2149,7 @@ impl Dit {
                     _ => None,
                 };
                 x = self.run_block(b, raws, x, &cx)?;
+
                 if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
                     if ci == 0 {
                         cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);

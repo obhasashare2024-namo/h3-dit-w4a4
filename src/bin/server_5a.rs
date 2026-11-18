@@ -244,15 +244,15 @@ fn worker_loop(
                 }],
                 refs: vec![],
                 seed: req.seed,
-                visual_cond_noise_aug: 0.0,
-                audio_cond_noise_aug: 0.0,
+                visual_cond_noise_aug: 0.999,
+                audio_cond_noise_aug: 1.0,
                 denoise: None,
                 control: None,
             };
 
             let video_shape = vid_lat.dims().to_vec();
             let audio_t = aud_lat.dim(3)?;
-            let sigmas = simple_sigmas(shifts[0] as f64, req.steps);
+            let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| simple_sigmas(shifts[0] as f64, req.steps));
 
             // Step 0 Gaussian Noise Initialization:
             let (xv, xa) = {
