@@ -1488,7 +1488,7 @@ impl QLinear {
         while start < rows {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
-            let yc = match self.fmt {
+            let mut yc = match self.fmt {
                 QFormat::GgufQuant { gtype: GgmlType::Q5K } => {
                     crate::dit::prof::time("  mmq_q5k gemm", dev, || {
                         kernels::mmq_q5_k(&xc, &raw.w, self.out_features, self.in_features)
@@ -1530,6 +1530,10 @@ impl QLinear {
                     })?
                 }
             };
+            for l in &self.loras {
+                let d = xc.matmul(&l.a.to_dtype(x.dtype())?.t()?)?.matmul(&l.b.to_dtype(x.dtype())?.t()?)?;
+                yc = (yc + (d * l.scale)?)?;
+            }
             outs.push(yc);
             start += n;
         }
