@@ -57,8 +57,17 @@ struct SampleReq {
     steps: usize,
     #[serde(default = "default_seed")]
     seed: u64,
+    #[serde(default = "default_false")]
+    render: bool,
+    #[serde(default = "default_render_target")]
+    render_target: String,
+    #[serde(default = "default_render_video_placement")]
+    render_video_placement: String,
+    #[serde(default = "default_render_audio_device")]
+    render_audio_device: String,
 }
 
+fn default_false() -> bool { false }
 fn default_output_path() -> String {
     "/mnt/R2D/tmp/minimax_bridge/stage2_denoised_phase5a_9425.edlat".to_string()
 }
@@ -76,6 +85,10 @@ struct SampleResp {
     seconds_per_step: f64,
     resident_blocks: String,
     tier_distribution: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendered_media: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    render_elapsed_seconds: Option<f64>,
 }
 
 struct SampleJob {
@@ -278,6 +291,34 @@ fn worker_loop(
                 }
             }
 
+            let (rendered_media, render_elapsed) = if req.render {
+                let t_rend = Instant::now();
+                let media_out = if req.render_target == "audio" {
+                    edlat_path.replace(".edlat", ".wav")
+                } else {
+                    edlat_path.replace(".edlat", ".mp4")
+                };
+                let bin_path = "/mnt/2tbnvS/h3-rs/target/release/examples/pipeline_e2e_av";
+                let status = std::process::Command::new(bin_path)
+                    .arg("--target").arg(&req.render_target)
+                    .arg("--input").arg(&edlat_path)
+                    .arg("--output").arg(&media_out)
+                    .arg("--video-placement").arg(&req.render_video_placement)
+                    .arg("--audio-device").arg(&req.render_audio_device)
+                    .status();
+                if let Ok(st) = status {
+                    if st.success() {
+                        (Some(media_out), Some((t_rend.elapsed().as_secs_f64() * 100.0).round() / 100.0))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
             let elapsed = t_start.elapsed().as_secs_f64();
             Ok(SampleResp {
                 status: "success".to_string(),
@@ -289,6 +330,8 @@ fn worker_loop(
                 seconds_per_step: ((elapsed / req.steps as f64) * 100.0).round() / 100.0,
                 resident_blocks: res_info.clone(),
                 tier_distribution: res_info.clone(),
+                rendered_media,
+                render_elapsed_seconds: render_elapsed,
             })
         })();
 
