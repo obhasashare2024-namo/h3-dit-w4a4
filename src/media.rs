@@ -250,3 +250,48 @@ pub fn resize_trilinear(src: &[f32], from: (usize, usize, usize), to: (usize, us
     }
     out
 }
+
+/// Zero-copy streaming muxing from CpuVid buffer directly into ffmpeg.
+/// Completely bypasses 14+ GB redundant Tensor allocations for long sequences.
+pub fn write_mp4_from_cpuvid(path: &str, vid: &crate::vae_video::CpuVid, fps: f64, audio: Option<(&Tensor, u32)>, crf: u32) -> Result<()> {
+    let (t, h, w) = (vid.f, vid.h, vid.w);
+    let fs = h * w;
+    let wav = audio.map(|_| format!("{path}.tmp.wav"));
+    if let (Some(wp), Some((a, sr))) = (&wav, audio) {
+        write_wav(wp, a, sr)?;
+    }
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
+    if let Some(wp) = &wav {
+        cmd.args(["-i", wp, "-c:a", "aac", "-b:a", "192k"]);
+    }
+    cmd.args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", &crf.to_string(), "-preset", "medium", "-movflags", "+faststart", path]);
+    let mut child = cmd.stdin(Stdio::piped()).spawn().context("running ffmpeg")?;
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut frame_buf = vec![0u8; fs * 3];
+        let r_base = 0;
+        let g_base = t * fs;
+        let b_base = 2 * t * fs;
+        for i in 0..t {
+            let offset = i * fs;
+            let r_slice = &vid.d[r_base + offset .. r_base + offset + fs];
+            let g_slice = &vid.d[g_base + offset .. g_base + offset + fs];
+            let b_slice = &vid.d[b_base + offset .. b_base + offset + fs];
+            for p in 0..fs {
+                frame_buf[p * 3 + 0] = (r_slice[p] * 255.0).round() as u8;
+                frame_buf[p * 3 + 1] = (g_slice[p] * 255.0).round() as u8;
+                frame_buf[p * 3 + 2] = (b_slice[p] * 255.0).round() as u8;
+            }
+            stdin.write_all(&frame_buf)?;
+        }
+    }
+    let st = child.wait()?;
+    if let Some(wp) = &wav {
+        let _ = std::fs::remove_file(wp);
+    }
+    if !st.success() {
+        bail!("ffmpeg failed with {st}");
+    }
+    Ok(())
+}

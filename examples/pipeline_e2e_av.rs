@@ -173,11 +173,9 @@ fn main() -> Result<()> {
     println!("[Video Pipeline] Decoding Video latents to RGB pixels on {}...", args.video_device);
     let zv_target = zv.to_device(&v_dev)?;
     let t_vdec = Instant::now();
-    let px = v_vae.decode(&zv_target)?;
-    println!("    Video decoded in {:.2}s, raw shape: {:?}", t_vdec.elapsed().as_secs_f64(), px.dims());
-    let frames = px.permute((1, 0, 2, 3))?.contiguous()?;
-    let (num_frames, c, h, w) = frames.dims4()?;
-    println!("    Video frames: {num_frames}, {w}x{h}, {c} channels @ 24fps");
+    let vid = v_vae.decode_cpuvid(&zv_target)?;
+    let (num_frames, h, w) = (vid.f, vid.h, vid.w);
+    println!("    Video decoded in {:.2}s, frames: {num_frames}, {w}x{h}, 3 channels @ 24fps (Zero-Copy CpuVid)", t_vdec.elapsed().as_secs_f64());
 
     // Check if we need audio
     let mut audio_tuple: Option<(Tensor, u32)> = None;
@@ -211,7 +209,7 @@ fn main() -> Result<()> {
     println!("\n[Muxing] Generating MP4: {}...", out_mp4);
     let t_mux = Instant::now();
     let audio_arg = audio_tuple.as_ref().map(|(w, sr)| (w, *sr));
-    write_mp4(&out_mp4, &frames, 24.0, audio_arg, 23)?;
+    h3_rs::media::write_mp4_from_cpuvid(&out_mp4, &vid, 24.0, audio_arg, 23)?;
     println!("    MP4 written in {:.2}s!", t_mux.elapsed().as_secs_f64());
 
     if let Some((wave, sr)) = audio_tuple {

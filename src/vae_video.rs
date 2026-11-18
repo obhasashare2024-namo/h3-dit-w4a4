@@ -130,6 +130,11 @@ impl VideoVae {
 
     /// Normalized latents `[1, 24, T, h, w]` -> pixels `[3, F, H, W]` f32 in [0, 1] on the CPU.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_cpuvid(z)?.into_tensor()
+    }
+
+    /// Decode to zero-copy CpuVid buffer directly without redundant Tensor permutations
+    pub fn decode_cpuvid(&self, z: &Tensor) -> Result<CpuVid> {
         let dec = self.dec.as_ref().ok_or_else(|| anyhow::anyhow!("this VAE file has no decoder"))?;
         let z = z.to_device(&self.dev)?.to_dtype(DType::F32)?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
@@ -138,8 +143,9 @@ impl VideoVae {
         if t == 1 {
             let zz = z.repeat((1, 1, TOKENS_CHUNK, 1, 1))?;
             let px = self.tiled_decode(dec, &zz)?;
-            let px = slice_frames(&px, FRAME_PRE_PADDING, FRAME_PRE_PADDING + 1);
-            return finalize(px);
+            let mut px = slice_frames(&px, FRAME_PRE_PADDING, FRAME_PRE_PADDING + 1);
+            finalize_inplace(&mut px);
+            return Ok(px);
         }
         let (pad_tokens, num_chunks) = decode_temporal_chunks(t);
         let z = if pad_tokens > 0 { Tensor::cat(&[z.clone(), z.narrow(2, t - 1, 1)?.repeat((1, 1, pad_tokens, 1, 1))?], 2)? } else { z };
@@ -181,7 +187,7 @@ impl VideoVae {
                 }
             }
         }
-        out.into_tensor()
+        Ok(out)
     }
 
     /// Spatially tiled decode of one temporal clip: `[1, 24, Tc, lh, lw]` (denormalized) ->
@@ -686,12 +692,12 @@ fn blend_t(a: &Tensor, b: &Tensor, extent: usize, dim: usize) -> Result<Tensor> 
 // CPU video buffer [C, F, H, W] for tile / chunk blending
 
 #[derive(Clone)]
-struct CpuVid {
-    c: usize,
-    f: usize,
-    h: usize,
-    w: usize,
-    d: Vec<f32>,
+pub struct CpuVid {
+    pub c: usize,
+    pub f: usize,
+    pub h: usize,
+    pub w: usize,
+    pub d: Vec<f32>,
 }
 
 impl CpuVid {
@@ -726,7 +732,7 @@ impl CpuVid {
             }
         }
     }
-    fn into_tensor(self) -> Result<Tensor> {
+    pub fn into_tensor(self) -> Result<Tensor> {
         Ok(Tensor::from_vec(self.d, (self.c, self.f, self.h, self.w), &Device::Cpu)?)
     }
 }
