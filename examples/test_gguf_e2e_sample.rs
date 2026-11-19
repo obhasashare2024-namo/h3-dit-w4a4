@@ -47,16 +47,18 @@ fn write_edlat_tensor<W: Write>(w: &mut W, t: &Tensor) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Explicitly select fastpath Tensor Core Dequant Arena (crush 3157s bottleneck)
+    std::env::set_var("H3_MMQ", "0");
+
     let dev = Device::new_cuda(0)?;
     let model_path = "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_flash_14b-Q3_K_M.gguf";
     let mut mem = MemoryConfig::default();
-    mem.dit_gpu_blocks = 22;
-    mem.dit_vram_blocks = 22;
-    mem.dit_ram_blocks = 25;
+    mem.dit_vram_blocks = 0;
+    mem.dit_ram_blocks = 48;
     mem.dit_disk_blocks = 0;
-    mem.offload = h3_rs::weights::Placement::Disk;
+    mem.offload = h3_rs::weights::Placement::Ram;
 
-    println!("[gguf-q3km-e2e] Loading GGUF Q3_K_M DiT: {}", model_path);
+    println!("[gguf-q3km-e2e] Loading GGUF Q3_K_M DiT with Zero-Disk Placement: {}", model_path);
     let dit = Dit::load(model_path, &dev, &mem, None)?;
 
     let mut f = File::open("/mnt/R2D/tmp/minimax_bridge/stage1_input_3s.edbin")?;
@@ -117,7 +119,7 @@ fn main() -> anyhow::Result<()> {
     println!("[gguf-q3km-e2e] Preparing DiT run with {} sigmas: {:?}", sigmas.len(), sigmas);
     let run = dit.prepare(&cond, &video_shape, audio_t, sigmas.clone())?;
 
-    println!("[gguf-q3km-e2e] Running full 6-step sampling (Rank 1 OP-1)...");
+    println!("[gguf-q3km-e2e] Running full 6-step sampling (Rank 1 OP-1 Accelerated)...");
     let t0 = Instant::now();
     let mut last_t = Instant::now();
     let sampled = sample_denoised(
@@ -130,12 +132,13 @@ fn main() -> anyhow::Result<()> {
         None,
         |step, total| {
             let step_ms = last_t.elapsed().as_secs_f64() * 1000.0;
-            println!("[gguf-q3km-e2e] Step {}/{} completed in {:.2}ms", step + 1, total, step_ms);
+            println!("[gguf-q3km-e2e] Step {}/{} completed in {:.2}ms ({:.2}s)", step + 1, total, step_ms, step_ms / 1000.0);
             last_t = Instant::now();
             Ok(())
         },
     )?;
-    println!("[gguf-q3km-e2e] All 6 steps finished in {:.2}s", t0.elapsed().as_secs_f64());
+    let total_elapsed = t0.elapsed().as_secs_f64();
+    println!("[gguf-q3km-e2e] All 6 steps finished in {:.2}s (avg {:.2}s/step)", total_elapsed, total_elapsed / 6.0);
 
     let out_path = "/mnt/2tbnvS/tmp/h3_q3km_e2e_3s.edlat";
     let mut out_file = File::create(out_path)?;
