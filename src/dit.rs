@@ -690,7 +690,7 @@ impl Dit {
                 && f.has(&format!("{p}.attn.out_proj.weight"))
                 && f.has(&format!("{p}.mlp.fc1.weight"))
                 && f.has(&format!("{p}.mlp.fc2.weight"));
-            let place = if i < tiers.vram || !is_fused {
+            let place = if i < tiers.vram || (!is_fused && streaming.is_some()) {
                 Placement::Gpu
             } else if i < tiers.vram + tiers.ram {
                 Placement::Ram

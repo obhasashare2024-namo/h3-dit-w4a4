@@ -1359,7 +1359,7 @@ pub fn int8_enabled() -> bool {
 
 pub fn mmq_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("H3_MMQ").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("H3_MMQ").map(|v| v != "0").unwrap_or(false))
 }
 
 /// A weight ready for GEMMs: raw int8 (tensor-core path) or dequantized.
