@@ -53,7 +53,18 @@ fn main() -> anyhow::Result<()> {
 
     let dev = Device::new_cuda(0)?;
     let model_path = "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_flash_14b_w4a4_preswizzled.safetensors";
-    let input_bundle = "/mnt/R2D/tmp/minimax_bridge/stage1_input_1080p_3s.edbin";
+    let input_bundle = std::env::args().nth(1).unwrap_or_else(|| "/mnt/R2D/tmp/minimax_bridge/stage1_input_1080p_3s.edbin".to_string());
+    let out_path = std::env::args().nth(2).unwrap_or_else(|| {
+        if input_bundle.contains("5s") {
+            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_5s.edlat".to_string()
+        } else if input_bundle.contains("8s") {
+            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_8s.edlat".to_string()
+        } else if input_bundle.contains("12s") {
+            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_12s.edlat".to_string()
+        } else {
+            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_3s.edlat".to_string()
+        }
+    });
 
     let mut mem = MemoryConfig::default();
     mem.dit_gpu_blocks = 26;
@@ -148,11 +159,10 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!("[w4a4-1080p] All 6 steps finished in {:.2}s", t0.elapsed().as_secs_f64());
 
-    let out_path = "/mnt/2tbnvS/tmp/h3_w4a4_1080p_3s.edlat";
-    let mut out_file = File::create(out_path)?;
+    let mut out_file = File::create(&out_path)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_v)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_a)?;
-    println!("[w4a4-1080p] Saved 1080P multi-modal sampled latents to {out_path} ({:.2} MB)", std::fs::metadata(out_path)?.len() as f64 / 1e6);
+    println!("[w4a4-1080p] Saved 1080P multi-modal sampled latents to {out_path} ({:.2} MB)", std::fs::metadata(&out_path)?.len() as f64 / 1e6);
 
     Ok(())
 }
