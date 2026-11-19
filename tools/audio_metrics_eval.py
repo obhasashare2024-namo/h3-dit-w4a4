@@ -57,7 +57,9 @@ def main():
         ("Golden Reference", "/mnt/2tbnvS/tmp/h3_render_1080p_3s_uncompressed.wav"),
         ("W4A8 Mixed", "/mnt/2tbnvS/tmp/h3_w4a8_e2e_3s.wav"),
         ("W4A4 Preswizzled", "/mnt/2tbnvS/tmp/h3_w4a4_e2e_3s.wav"),
+        ("Mastered W4A4 (Lim)", "/mnt/2tbnvS/tmp/h3_w4a4_e2e_3s_mastered.wav"),
         ("GGUF Q3_K_M", "/mnt/2tbnvS/tmp/h3_q3km_e2e_3s.wav"),
+        ("Mastered Q3_K_M (Lim)", "/mnt/2tbnvS/tmp/h3_q3km_e2e_3s_mastered.wav"),
     ]
 
     print("=" * 95)

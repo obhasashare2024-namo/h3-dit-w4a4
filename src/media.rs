@@ -1,5 +1,6 @@
 //! Image input, resizing, and MP4 (h264 + AAC) / WAV output.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -79,14 +80,115 @@ pub fn resize_bilinear(x: &Tensor, oh: usize, ow: usize) -> Result<Tensor> {
     Ok(Tensor::from_vec(out, (n, c, oh, ow), &Device::Cpu)?)
 }
 
-/// Write stereo f32 audio `[2, L]` as 16-bit PCM WAV.
+/// Soft limiter with lookahead to prevent hard clipping while preserving audio dynamics and zero harmonic spray.
+pub fn soft_limit(data: &[Vec<f32>], sample_rate: u32, ceiling: f32, lookahead_ms: f32, release_ms: f32) -> Vec<Vec<f32>> {
+    let ch = data.len();
+    if ch == 0 {
+        return vec![];
+    }
+    let len = data[0].len();
+    if len == 0 {
+        return vec![vec![]; ch];
+    }
+    let w = (lookahead_ms * sample_rate as f32 / 1000.0).round() as usize;
+    let alpha = (-1.0 / (sample_rate as f32 * release_ms / 1000.0)).exp();
+
+    // 1. Peak envelope across channels
+    let mut peak = vec![0.0f32; len];
+    let mut global_max = 0.0f32;
+    for i in 0..len {
+        let mut m = 0.0f32;
+        for c in 0..ch {
+            let a = data[c][i].abs();
+            if a > m {
+                m = a;
+            }
+        }
+        peak[i] = m;
+        if m > global_max {
+            global_max = m;
+        }
+    }
+
+    if global_max <= ceiling {
+        return data.to_vec();
+    }
+
+    // 2. Sliding window maximum over lookahead window [i, i + w]
+    let mut env = vec![0.0f32; len];
+    let mut max_queue: VecDeque<(usize, f32)> = VecDeque::new();
+    let total_len = len + w;
+    for idx in 0..total_len {
+        let val = if idx < len { peak[idx] } else { peak[len - 1] };
+        while let Some(&(_, v)) = max_queue.back() {
+            if v <= val {
+                max_queue.pop_back();
+            } else {
+                break;
+            }
+        }
+        max_queue.push_back((idx, val));
+
+        if idx >= w {
+            let out_idx = idx - w;
+            while let Some(&(first_idx, _)) = max_queue.front() {
+                if first_idx < out_idx {
+                    max_queue.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if let Some(&(_, max_val)) = max_queue.front() {
+                env[out_idx] = max_val;
+            }
+        }
+    }
+
+    // 3. Compute gain curve with instantaneous attack & smooth exponential release
+    let mut gain = vec![1.0f32; len];
+    let mut g = 1.0f32;
+    for i in 0..len {
+        let target_g = if env[i] > ceiling {
+            ceiling / env[i]
+        } else {
+            1.0f32
+        };
+        if target_g < g {
+            g = target_g;
+        } else {
+            g = g * alpha + target_g * (1.0 - alpha);
+        }
+        gain[i] = g;
+    }
+
+    // 4. Apply gain
+    let mut out = vec![vec![0.0f32; len]; ch];
+    for c in 0..ch {
+        for i in 0..len {
+            out[c][i] = data[c][i] * gain[i];
+        }
+    }
+    out
+}
+
+/// Write stereo f32 audio as 16-bit PCM WAV with automatic lookahead soft limiting (ceiling=0.95).
 pub fn write_wav(path: &str, audio: &Tensor, sample_rate: u32) -> Result<()> {
+    write_wav_with_limiter(path, audio, sample_rate, true)
+}
+
+/// Write stereo f32 audio as 16-bit PCM WAV, with optional lookahead soft limiter.
+pub fn write_wav_with_limiter(path: &str, audio: &Tensor, sample_rate: u32, limit: bool) -> Result<()> {
     let (ch, len) = audio.dims2()?;
     let data = audio.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
+    let limited_data = if limit {
+        soft_limit(&data, sample_rate, 0.95, 5.0, 50.0)
+    } else {
+        data
+    };
     let spec = hound::WavSpec { channels: ch as u16, sample_rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let mut w = hound::WavWriter::create(path, spec)?;
     for i in 0..len {
-        for c in data.iter() {
+        for c in limited_data.iter() {
             w.write_sample((c[i].clamp(-1.0, 1.0) * 32767.0).round() as i16)?;
         }
     }
@@ -294,4 +396,39 @@ pub fn write_mp4_from_cpuvid(path: &str, vid: &crate::vae_video::CpuVid, fps: f6
         bail!("ffmpeg failed with {st}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_soft_limit_passthrough() {
+        let input = vec![vec![0.1, 0.5, -0.7, 0.8, -0.4]];
+        let out = soft_limit(&input, 32000, 0.95, 5.0, 50.0);
+        assert_eq!(input, out);
+    }
+
+    #[test]
+    fn test_soft_limit_clamping_suppression() {
+        let mut channel = vec![0.1f32; 500];
+        channel[100] = 1.5;
+        channel[101] = 1.4;
+        let input = vec![channel];
+        let out = soft_limit(&input, 32000, 0.95, 5.0, 50.0);
+        let max_val = out[0].iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(max_val <= 0.95001, "Expected peak <= 0.95, got {}", max_val);
+        let consecutive_clips = out[0].iter().filter(|&&x| x.abs() >= 0.999).count();
+        assert_eq!(consecutive_clips, 0, "Expected 0 clipped samples");
+    }
+
+    #[test]
+    fn test_soft_limit_lookahead_anticipation() {
+        let mut channel = vec![0.2f32; 1000];
+        channel[200] = 2.0;
+        let input = vec![channel];
+        let out = soft_limit(&input, 32000, 0.95, 5.0, 50.0);
+        assert!(out[0][40] < 0.2, "Lookahead should attenuate samples before peak arrives");
+        assert!(out[0][200].abs() <= 0.95001);
+    }
 }
