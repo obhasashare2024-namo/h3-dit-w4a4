@@ -67,16 +67,25 @@ pub fn sample_denoised(
     for i in 0..n {
         let (s, s_next) = (sigmas[i], sigmas[i + 1]);
         let (ov, oa, dv, da);
+        let (sv, sa) = (dit.cfg.shift_video, dit.cfg.shift_audio);
         match inpaint {
             None => {
-                (ov, oa) = dit.forward(run, &xv, &xa, s)?;
-                // CONST: denoised = x - out * sigma
-                dv = (&xv - (&ov * s)?)?;
-                da = (&xa - (&oa * s)?)?;
+                (ov, oa) = dit.forward_sampler(run, &xv, &xa, s, sampler)?;
+                let euler = sampler == Sampler::Euler || s_next == 0.0 || old.is_none();
+                if euler {
+                    let audio_slope = crate::dit::time_shift_slope(s, sv, sa);
+                    let sigma_a = crate::dit::time_shift_sigma(s, sv, sa);
+                    let oa_eff = (&oa / audio_slope)?;
+                    dv = (&xv - (&ov * s)?)?;
+                    da = (&xa - (&oa_eff * sigma_a)?)?;
+                } else {
+                    dv = (&xv - (&ov * s)?)?;
+                    da = (&xa - (&oa * s)?)?;
+                }
             }
             Some(ip) => {
                 let (iv, ia) = ip.inject(&xv, &xa, s)?;
-                let (fv, fa) = dit.forward(run, &iv, &ia, s)?;
+                let (fv, fa) = dit.forward_sampler(run, &iv, &ia, s, sampler)?;
                 let (mv, ma) = ip.merge(&(&iv - (&fv * s)?)?, &(&ia - (&fa * s)?)?)?;
                 // the update follows the restored prediction: d = (x - denoised) / sigma
                 ov = ((&xv - &mv)? / s)?;
@@ -87,8 +96,12 @@ pub fn sample_denoised(
         }
         let euler = sampler == Sampler::Euler || s_next == 0.0 || old.is_none();
         if euler {
+            let audio_slope = crate::dit::time_shift_slope(s, sv, sa);
+            let sigma_a = crate::dit::time_shift_sigma(s, sv, sa);
+            let sigma_a_next = if s_next == 0.0 { 0.0 } else { crate::dit::time_shift_sigma(s_next, sv, sa) };
             xv = (&xv + (&ov * (s_next - s))?)?;
-            xa = (&xa + (&oa * (s_next - s))?)?;
+            let oa_eff = (&oa / audio_slope)?;
+            xa = (&xa + (&oa_eff * (sigma_a_next - sigma_a))?)?;
         } else {
             let tf = |x: f64| -x.ln();
             let (t, t_old, t_next, t_prev) = (tf(s), tf(old_sigma_down.unwrap()), tf(s_next), tf(sigmas[i - 1]));
@@ -109,6 +122,11 @@ pub fn sample_denoised(
         on_step(i + 1, n)?;
         crate::dit::prof::dump();
     }
-    let (denoised_v, denoised_a) = last.ok_or_else(|| anyhow::anyhow!("sigma schedule needs at least 2 values"))?;
+    let (denoised_v, mut denoised_a) = last.ok_or_else(|| anyhow::anyhow!("sigma schedule needs at least 2 values"))?;
+    if sampler == Sampler::ResMultistep {
+        let scale = dit.audio_scale();
+        denoised_a = (denoised_a / scale)?;
+        xa = (xa / scale)?;
+    }
     Ok(Sampled { xv, xa, denoised_v, denoised_a })
 }

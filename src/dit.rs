@@ -59,6 +59,14 @@ pub fn time_shift_sigma(sigma: f64, from_shift: f64, to_shift: f64) -> f64 {
     to_shift * base / (1.0 + (to_shift - 1.0) * base)
 }
 
+pub fn time_shift_slope(sigma: f64, from_shift: f64, to_shift: f64) -> f64 {
+    let base = sigma / (from_shift + sigma * (1.0 - from_shift));
+    let a = 1.0 + (from_shift - 1.0) * base;
+    let b = 1.0 + (to_shift - 1.0) * base;
+    to_shift * a * a / (from_shift * b * b)
+}
+
+
 // ----------------------------------------------------------------------------------------------
 // Packed layout
 // ----------------------------------------------------------------------------------------------
@@ -1918,18 +1926,37 @@ impl Dit {
     /// schedule); the returned audio velocity is in the same carried space. `sigma` is the video
     /// sigma. Returns the flow outputs `[video, audio]` (CONST parameterization).
     pub fn forward(&self, run: &DitRun, x_video: &Tensor, x_audio: &Tensor, sigma: f64) -> Result<(Tensor, Tensor)> {
-        let scale = self.audio_scale();
+        self.forward_sampler(run, x_video, x_audio, sigma, crate::sampling::Sampler::Euler)
+    }
+
+    pub fn forward_sampler(&self, run: &DitRun, x_video: &Tensor, x_audio: &Tensor, sigma: f64, sampler: crate::sampling::Sampler) -> Result<(Tensor, Tensor)> {
         let (sv, sa) = (self.cfg.shift_video, self.cfg.shift_audio);
         let sigma_v = sigma.max(1e-6);
         let sigma_a = time_shift_sigma(sigma_v, sv, sa);
-        let carry = sigma_a / sigma_v;
-        let audio_own = (x_audio * carry)?;
-        let (v, a) = self.forward_inner(run, x_video, &audio_own, sigma_v, sigma_a)?;
-        let a = if scale != 1.0 { ((&audio_own * (1.0 - scale))? + (a * (1.0 + (scale - 1.0) * sigma_a))?)? } else { a };
-        Ok((v, a))
+
+        match sampler {
+            crate::sampling::Sampler::Euler => {
+                let (v, a) = self.forward_inner(run, x_video, x_audio, sigma_v, sigma_a)?;
+                Ok((v, a))
+            }
+            crate::sampling::Sampler::ResMultistep => {
+                let scale = self.audio_scale();
+                let audio_slope = time_shift_slope(sigma_v, sv, sa);
+                let carry = sigma_a / sigma_v;
+                let audio_own = (x_audio * carry)?;
+                let (v, a) = self.forward_inner(run, x_video, &audio_own, sigma_v, sigma_a)?;
+                let a_scaled = if scale != 1.0 {
+                    let a_div_slope = (&a / audio_slope)?;
+                    ((&audio_own * (1.0 - scale))? + (a_div_slope * (1.0 + (scale - 1.0) * sigma_a))?)?
+                } else {
+                    a
+                };
+                Ok((v, a_scaled))
+            }
+        }
     }
 
-    fn forward_inner(&self, run: &DitRun, x_video: &Tensor, x_audio: &Tensor, sigma_v: f64, sigma_a: f64) -> Result<(Tensor, Tensor)> {
+    pub fn forward_inner(&self, run: &DitRun, x_video: &Tensor, x_audio: &Tensor, sigma_v: f64, sigma_a: f64) -> Result<(Tensor, Tensor)> {
         let dev = &self.dev;
         let (_, _, ot, oh, ow) = x_video.dims5()?;
         let xv = x_video.to_dtype(DType::F32)?;
