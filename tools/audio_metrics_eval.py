@@ -60,6 +60,8 @@ def main():
         ("Mastered W4A4 (Lim)", "/mnt/2tbnvS/tmp/h3_w4a4_e2e_3s_mastered.wav"),
         ("GGUF Q3_K_M", "/mnt/2tbnvS/tmp/h3_q3km_e2e_3s.wav"),
         ("Mastered Q3_K_M (Lim)", "/mnt/2tbnvS/tmp/h3_q3km_e2e_3s_mastered.wav"),
+        ("Real Person W4A8", "/mnt/2tbnvS/tmp/h3_w4a8_real_person_3s.wav"),
+        ("Natural Flow W4A4", "/mnt/2tbnvS/tmp/h3_w4a4_natural_flow_3s.wav"),
     ]
 
     print("=" * 95)

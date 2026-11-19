@@ -73,11 +73,9 @@ pub fn sample_denoised(
                 (ov, oa) = dit.forward_sampler(run, &xv, &xa, s, sampler)?;
                 let euler = sampler == Sampler::Euler || s_next == 0.0 || old.is_none();
                 if euler {
-                    let audio_slope = crate::dit::time_shift_slope(s, sv, sa);
                     let sigma_a = crate::dit::time_shift_sigma(s, sv, sa);
-                    let oa_eff = (&oa / audio_slope)?;
                     dv = (&xv - (&ov * s)?)?;
-                    da = (&xa - (&oa_eff * sigma_a)?)?;
+                    da = (&xa - (&oa * sigma_a)?)?;
                 } else {
                     dv = (&xv - (&ov * s)?)?;
                     da = (&xa - (&oa * s)?)?;
@@ -96,12 +94,10 @@ pub fn sample_denoised(
         }
         let euler = sampler == Sampler::Euler || s_next == 0.0 || old.is_none();
         if euler {
-            let audio_slope = crate::dit::time_shift_slope(s, sv, sa);
             let sigma_a = crate::dit::time_shift_sigma(s, sv, sa);
             let sigma_a_next = if s_next == 0.0 { 0.0 } else { crate::dit::time_shift_sigma(s_next, sv, sa) };
             xv = (&xv + (&ov * (s_next - s))?)?;
-            let oa_eff = (&oa / audio_slope)?;
-            xa = (&xa + (&oa_eff * (sigma_a_next - sigma_a))?)?;
+            xa = (&xa + (&oa * (sigma_a_next - sigma_a))?)?;
         } else {
             let tf = |x: f64| -x.ln();
             let (t, t_old, t_next, t_prev) = (tf(s), tf(old_sigma_down.unwrap()), tf(s_next), tf(sigmas[i - 1]));
