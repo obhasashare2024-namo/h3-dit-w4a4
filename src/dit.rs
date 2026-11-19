@@ -2372,3 +2372,45 @@ pub mod log {
         eprintln!("[h3] WARNING: {s}");
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_time_shift_equal_shifts_identity() {
+        for s in [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] {
+            let s_shifted = time_shift_sigma(s, 5.0, 5.0);
+            assert!((s_shifted - s).abs() < 1e-12, "time_shift_sigma should be identity when shifts match: {} vs {}", s_shifted, s);
+
+            let slope = time_shift_slope(s, 5.0, 5.0);
+            assert!((slope - 1.0).abs() < 1e-12, "time_shift_slope should be 1.0 when shifts match: {}", slope);
+        }
+    }
+
+    #[test]
+    fn test_time_shift_slope_finite_boundaries() {
+        let (sv, sa) = (5.0, 1.0);
+        for s in [1e-7, 1e-5, 0.001, 0.5, 0.999, 1.0 - 1e-7] {
+            let slope = time_shift_slope(s, sv, sa);
+            assert!(slope.is_finite(), "slope must be finite at s={}: {}", s, slope);
+            assert!(slope > 0.0, "slope must be positive at s={}: {}", s, slope);
+        }
+    }
+
+    #[test]
+    fn test_rectified_linear_flow_exact_recovery() -> anyhow::Result<()> {
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let x0 = Tensor::new(&[1.5f32, -2.0, 0.5, 3.0], &dev)?;
+        let eps = Tensor::new(&[0.1f32, 0.2, -0.3, -0.4], &dev)?;
+        let sigma = 0.8f64;
+        let x_sig = ((&x0 * (1.0 - sigma))? + (&eps * sigma)?)?;
+        let out = ((&x_sig - &x0)? / sigma)?;
+        let recovered = (&x_sig - (&out * sigma)?)?;
+        let diff = (recovered - x0)?.abs()?.max(0)?.to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "Single step linear flow reconstruction must be exact: diff={}", diff);
+        Ok(())
+    }
+}
