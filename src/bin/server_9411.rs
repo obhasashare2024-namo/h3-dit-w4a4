@@ -46,6 +46,12 @@ struct Args {
 
     #[arg(long, default_value_t = 2048)]
     mlp_chunk: usize,
+
+    #[arg(long, default_value = "attn8")]
+    attn: String,
+
+    #[arg(long, default_value_t = true)]
+    streaming: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -345,7 +351,14 @@ async fn handle_sample(tx: std_mpsc::Sender<SampleJob>, body: Bytes) -> HttpResp
 #[ntex::main(name = "server_9411", signals = true)]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    if std::env::var("H3_ATTN").is_err() {
+        std::env::set_var("H3_ATTN", &args.attn);
+    }
+    if std::env::var("H3_STREAMING").is_err() {
+        std::env::set_var("H3_STREAMING", if args.streaming { "1" } else { "0" });
+    }
     println!("=== Starting MiniMax H3 W4A4 DiT Microservice (Port {}) ===", args.port);
+    println!("  Accelerations: H3_ATTN={}, H3_STREAMING={}", std::env::var("H3_ATTN").unwrap_or_default(), std::env::var("H3_STREAMING").unwrap_or_default());
 
     let (tx, rx) = std_mpsc::channel();
     let model_path = args.model.clone();
