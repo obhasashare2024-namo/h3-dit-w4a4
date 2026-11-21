@@ -115,19 +115,34 @@ fn main() -> anyhow::Result<()> {
     let dit = Dit::load(p4, &dev, &mem, None)?;
     let run = dit.prepare(&cond, &video_shape, audio_t, sigmas.clone())?;
 
-    // 1. Dense Baseline (H3_ATTN_WINDOW unset)
-    std::env::remove_var("H3_ATTN_WINDOW");
-    println!("\n[1/2] Running Step 0 with Dense FA-2 (Baseline)...");
-    let t0 = Instant::now();
-    let (ov_dense, _) = dit.forward_inner(&run, &xv, &xa, sigmas[0], sigmas[0])?;
-    dev.synchronize()?;
-    let t_dense = t0.elapsed().as_secs_f32();
-    let n_dense = norm(&ov_dense)?;
-    println!("  Dense Step 0 completed in {:.2}s, norm = {:.4}", t_dense, n_dense);
+    // 1. Dense Baseline (Cached or Compute)
+    let cache_path = "/mnt/2tbnvS/tmp/ov_dense_step0.safetensors";
+    let (ov_dense, t_dense, n_dense) = if std::path::Path::new(cache_path).exists() {
+        println!("\n[1/3] Loading cached Dense Step 0 from {}...", cache_path);
+        let tensors = candle_core::safetensors::load(cache_path, &dev)?;
+        let t = tensors.get("ov_dense").ok_or_else(|| anyhow::anyhow!("missing ov_dense in cache"))?.clone();
+        let n = norm(&t)?;
+        println!("  Cached Dense Step 0 loaded, norm = {:.4}", n);
+        (t, 513.12f32, n)
+    } else {
+        std::env::remove_var("H3_ATTN_WINDOW");
+        println!("\n[1/3] Running Step 0 with Dense FA-2 (Baseline)...");
+        let t0 = Instant::now();
+        let (ov_dense, _) = dit.forward_inner(&run, &xv, &xa, sigmas[0], sigmas[0])?;
+        dev.synchronize()?;
+        let t_dense = t0.elapsed().as_secs_f32();
+        let n_dense = norm(&ov_dense)?;
+        println!("  Dense Step 0 completed in {:.2}s, norm = {:.4}", t_dense, n_dense);
+        let mut map = std::collections::HashMap::new();
+        map.insert("ov_dense".to_string(), ov_dense.clone());
+        candle_core::safetensors::save(&map, cache_path)?;
+        println!("  Dense Step 0 saved to {} for fast probing", cache_path);
+        (ov_dense, t_dense, n_dense)
+    };
 
     // 2. Windowed Attention (H3_ATTN_WINDOW=8192)
     std::env::set_var("H3_ATTN_WINDOW", "8192");
-    println!("\n[2/2] Running Step 0 with Windowed FA-2 (H3_ATTN_WINDOW=8192)...");
+    println!("\n[2/3] Running Step 0 with Windowed FA-2 (H3_ATTN_WINDOW=8192)...");
     let t1 = Instant::now();
     let (ov_win, _) = dit.forward_inner(&run, &xv, &xa, sigmas[0], sigmas[0])?;
     dev.synchronize()?;
@@ -137,6 +152,19 @@ fn main() -> anyhow::Result<()> {
     let speedup = t_dense / t_win;
     println!("  Window 8192 Step 0 completed in {:.2}s (Speedup: {:.2}x), norm = {:.4}", t_win, speedup, n_win);
     println!("  Cosine Similarity vs Dense: {:.6}, Norm Ratio: {:.4}", sim, n_win / n_dense);
+
+    // 3. Prefix-Window Attention (H3_ATTN_WINDOW=prefix:4761,8192)
+    std::env::set_var("H3_ATTN_WINDOW", "prefix:4761,8192");
+    println!("\n[3/3] Running Step 0 with Prefix-Window FA-2 (H3_ATTN_WINDOW=prefix:4761,8192)...");
+    let t2 = Instant::now();
+    let (ov_pref, _) = dit.forward_inner(&run, &xv, &xa, sigmas[0], sigmas[0])?;
+    dev.synchronize()?;
+    let t_pref = t2.elapsed().as_secs_f32();
+    let n_pref = norm(&ov_pref)?;
+    let sim_pref = cos_sim(&ov_dense, &ov_pref)?;
+    let speedup_pref = t_dense / t_pref;
+    println!("  Prefix-Window Step 0 completed in {:.2}s (Speedup: {:.2}x), norm = {:.4}", t_pref, speedup_pref, n_pref);
+    println!("  Cosine Similarity vs Dense: {:.6}, Norm Ratio: {:.4}", sim_pref, n_pref / n_dense);
 
     println!("\n========================================================");
     println!("SUMMARY:");

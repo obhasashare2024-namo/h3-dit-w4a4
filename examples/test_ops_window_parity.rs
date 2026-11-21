@@ -56,8 +56,8 @@ fn main() -> anyhow::Result<()> {
         dense_ms, dense_ms * 14.0 * 47.0 / 1000.0, nan0, inf0);
 
     // 2. Windowed Attention Tests
-    for win in [32768, 16384, 8192, 4096] {
-        std::env::set_var("H3_ATTN_WINDOW", win.to_string());
+    for win in ["32768", "16384", "8192", "4096", "prefix:4761,8192"] {
+        std::env::set_var("H3_ATTN_WINDOW", win);
         println!("\n2. Running Windowed ops::attention (H3_ATTN_WINDOW={})...", win);
         let t1 = Instant::now();
         let out_win = h3_rs::ops::attention(&q, &k, &v, false)?;
