@@ -158,6 +158,32 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Spawn async concurrent audio decoding thread if target == "both" and audio latent exists
+    let audio_thread = if args.target == "both" {
+        if let Some(za_tensor) = za {
+            let a_dev_clone = a_dev.clone();
+            let audio_vae_path = args.audio_vae.clone();
+            let audio_device_name = args.audio_device.clone();
+            println!("\n[Audio Pipeline] Spawning async concurrent Audio VAE thread on {}...", audio_device_name);
+            Some(std::thread::spawn(move || -> Result<(Tensor, u32)> {
+                let t_aload = Instant::now();
+                let a_vae = AudioVae::load(&audio_vae_path, &a_dev_clone)?;
+                println!("    [Async Audio] Audio VAE loaded in {:.2}s (sample rate: {} Hz)", t_aload.elapsed().as_secs_f64(), a_vae.sample_rate);
+
+                println!("    [Async Audio] Decoding audio waveform (BigVGAN) on {}...", audio_device_name);
+                let t_adec = Instant::now();
+                let wave = a_vae.decode(&za_tensor.to_device(&a_dev_clone)?)?;
+                let sr = a_vae.sample_rate;
+                println!("    [Async Audio] Audio decoded in {:.2}s on {}, waveform shape: {:?}", t_adec.elapsed().as_secs_f64(), audio_device_name, wave.dims());
+                Ok((wave, sr))
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Video pipeline (either 'video' or 'both')
     println!("\n[Video Pipeline] Loading Video VAE (Device: {}, Placement: {:?}) from {}...", args.video_device, v_place, args.video_vae);
     let mut mem = MemoryConfig::default();
@@ -177,25 +203,18 @@ fn main() -> Result<()> {
     let (num_frames, h, w) = (vid.f, vid.h, vid.w);
     println!("    Video decoded in {:.2}s, frames: {num_frames}, {w}x{h}, 3 channels @ 24fps (Zero-Copy CpuVid)", t_vdec.elapsed().as_secs_f64());
 
-    // Check if we need audio
+    // Join async audio thread and synchronize
     let mut audio_tuple: Option<(Tensor, u32)> = None;
-    if args.target == "both" {
-        if let Some(za_tensor) = za {
-            println!("\n[Audio Pipeline] Loading Audio VAE to {} from {}...", args.audio_device, args.audio_vae);
-            let t_aload = Instant::now();
-            let a_vae = AudioVae::load(&args.audio_vae, &a_dev)?;
-            println!("    Audio VAE loaded in {:.2}s (sample rate: {} Hz)", t_aload.elapsed().as_secs_f64(), a_vae.sample_rate);
-
-            println!("[Audio Pipeline] Decoding Audio waveform (BigVGAN) on {}...", args.audio_device);
-            let t_adec = Instant::now();
-            let wave = a_vae.decode(&za_tensor.to_device(&a_dev)?)?;
-            let sr = a_vae.sample_rate;
-            println!("    Audio decoded in {:.2}s on {}, waveform shape: {:?}", t_adec.elapsed().as_secs_f64(), args.audio_device, wave.dims());
-
-            let expected_samples = ((num_frames as f64 / 24.0) * sr as f64).round() as usize;
-            let wave_trimmed = wave.narrow(1, 0, expected_samples.min(wave.dim(1)?))?;
-            audio_tuple = Some((wave_trimmed, sr));
-        }
+    if let Some(handle) = audio_thread {
+        println!("\n[Pipeline Sync] Synchronizing concurrent audio decoding thread...");
+        let t_sync = Instant::now();
+        let (wave, sr) = handle.join().map_err(|e| anyhow::anyhow!("Audio thread panicked: {:?}", e))??;
+        println!("    [Pipeline Sync] Audio thread completed! (Wait time: {:.3}s)", t_sync.elapsed().as_secs_f64());
+        let expected_samples = ((num_frames as f64 / 24.0) * sr as f64).round() as usize;
+        let wave_trimmed = wave.narrow(1, 0, expected_samples.min(wave.dim(1)?))?;
+        audio_tuple = Some((wave_trimmed, sr));
+    } else if args.target == "both" {
+        println!("\n[Video Pipeline] No audio latent found in input edlat, skipping audio mux.");
     } else {
         println!("\n[Video Only Mode] Skipping Audio VAE load & decode (0 audio VRAM used).");
     }
