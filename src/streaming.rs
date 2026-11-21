@@ -351,17 +351,18 @@ unsafe impl Send for StreamingEngine {}
 unsafe impl Sync for StreamingEngine {}
 
 /// Extract the raw `CUdeviceptr` from a 1D `DType::U8` Candle `Tensor`.
-fn tensor_u8_dptr(t: &Tensor) -> Result<u64> {
+fn tensor_storage_dptr(t: &Tensor) -> Result<u64> {
     let (st, l) = t.storage_and_layout();
     let Storage::Cuda(c) = &*st else {
         bail!("Expected CUDA tensor for VRAM staging slot");
     };
     let stream = c.device.cuda_stream();
-    let CudaStorageSlice::U8(slice) = &c.slice else {
-        bail!("Expected U8 storage slice");
+    let (ptr, _guard) = match &c.slice {
+        CudaStorageSlice::I32(slice) => slice.device_ptr(&stream),
+        CudaStorageSlice::U8(slice) => slice.device_ptr(&stream),
+        _ => bail!("Expected I32 or U8 storage slice"),
     };
-    let (ptr, _guard) = slice.device_ptr(&stream);
-    Ok(ptr + l.start_offset() as u64)
+    Ok(ptr + (l.start_offset() as u64 * t.dtype().size_in_bytes() as u64))
 }
 
 impl StreamingEngine {
@@ -389,9 +390,10 @@ impl StreamingEngine {
 
         // Allocate the 2 static VRAM staging buffers (Buffer A & Buffer B) once at startup
         let alloc_slot = |idx: usize| -> Result<VramSlot> {
-            let arena = Tensor::zeros(max_block_bytes, DType::U8, dev)
+            let max_words = max_block_bytes.div_ceil(4);
+            let arena = Tensor::zeros(max_words, DType::I32, dev)
                 .with_context(|| format!("Allocating VRAM StagingRing slot {idx}"))?;
-            let dptr = tensor_u8_dptr(&arena)?;
+            let dptr = tensor_storage_dptr(&arena)?;
             let mut ev_copy_done: sys::CUevent = std::ptr::null_mut();
             let mut ev_compute_done: sys::CUevent = std::ptr::null_mut();
             unsafe {
@@ -583,9 +585,12 @@ impl StreamingEngine {
         // Construct zero-copy Tensor sub-views backed by `slot.arena`'s persistent Arc<Storage>
         let mut raws = Vec::with_capacity(4);
         for proj in &layout.projs {
+            let word_offset = proj.block_offset / 4;
+            let word_len = proj.byte_len / 4;
             let view = slot
                 .arena
-                .narrow(0, proj.block_offset, proj.byte_len)?;
+                .narrow(0, word_offset, word_len)?
+                .reshape(proj.shape.as_slice())?;
             raws.push(Raw { w: view, bs: None });
         }
         Ok(raws.try_into().ok().unwrap())

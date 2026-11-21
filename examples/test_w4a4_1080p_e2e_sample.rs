@@ -47,39 +47,36 @@ fn write_edlat_tensor<W: Write>(w: &mut W, t: &Tensor) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    std::env::set_var("H3_ATTN", "attn8");
+    std::env::set_var("H3_ATTN_GROUPS", "14");
+    std::env::set_var("H3_STREAMING", "1");
+    std::env::set_var("H3_FORCE_GPU_ATT", "1");
     println!("========================================================");
-    println!("  MiniMax H3 W4A4 1080P 3s End-to-End Portrait Sampling ");
+    println!("  MiniMax H3 W4A4 1080P End-to-End Portrait Sampling    ");
     println!("========================================================");
 
     let dev = Device::new_cuda(0)?;
-    let model_path = "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_flash_14b_w4a4_preswizzled.safetensors";
-    let input_bundle = std::env::args().nth(1).unwrap_or_else(|| "/mnt/R2D/tmp/minimax_bridge/stage1_input_1080p_3s.edbin".to_string());
-    let out_path = std::env::args().nth(2).unwrap_or_else(|| {
-        if input_bundle.contains("5s") {
-            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_5s.edlat".to_string()
-        } else if input_bundle.contains("8s") {
-            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_8s.edlat".to_string()
-        } else if input_bundle.contains("12s") {
-            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_12s.edlat".to_string()
-        } else {
-            "/mnt/2tbnvS/tmp/h3_w4a4_1080p_3s.edlat".to_string()
-        }
-    });
+    let args: Vec<String> = std::env::args().collect();
+    let input_bundle = if args.len() > 1 { args[1].clone() } else { "/mnt/2tbnvS/tmp/stage1_input_1080p_8s.edbin".to_string() };
+    let out_path = if args.len() > 2 { args[2].clone() } else { "/mnt/2tbnvS/tmp/h3_w4a4_1080p_8s_valid.edlat".to_string() };
+    let model_path = if args.len() > 3 { args[3].clone() } else { "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_50b_w4a4_preswizzled.safetensors".to_string() };
 
     let mut mem = MemoryConfig::default();
-    mem.dit_gpu_blocks = 26;
-    mem.dit_vram_blocks = 26;
-    mem.dit_ram_blocks = 21;
+    mem.dit_gpu_blocks = 0;
+    mem.dit_vram_blocks = 0;
+    mem.dit_ram_blocks = if model_path.contains("50b") || model_path.contains("w4a8") { 50 } else { 48 };
     mem.dit_disk_blocks = 0;
     mem.token_chunk = 4096;
     mem.mlp_chunk = 2048;
-    mem.offload = h3_rs::weights::Placement::Disk;
+    mem.offload = h3_rs::weights::Placement::Ram;
 
-    println!("[w4a4-1080p] Loading W4A4 DiT...");
-    let dit = Dit::load(model_path, &dev, &mem, None)?;
+    println!("[w4a4-1080p] Loading W4A4 DiT from: {}...", model_path);
+    println!("[w4a4-1080p] Input bundle: {}", input_bundle);
+    println!("[w4a4-1080p] Output edlat: {}", out_path);
+    let dit = Dit::load(&model_path, &dev, &mem, None)?;
 
-    println!("[w4a4-1080p] Reading 1080P 3s bundle: {input_bundle}...");
-    let mut f = File::open(input_bundle)?;
+    println!("[w4a4-1080p] Reading bundle: {input_bundle}...");
+    let mut f = File::open(&input_bundle)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     let mut header = [0i32; 4];
@@ -128,7 +125,10 @@ fn main() -> anyhow::Result<()> {
 
     let video_shape = vid_lat.dims().to_vec();
     let audio_t = aud_lat.dim(3)?;
-    let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| simple_sigmas(shifts[0] as f64, 6));
+    let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| {
+        println!("[w4a4-1080p] Using HyperFlow 6-step distillation schedule");
+        vec![1.0, 0.982655942440033, 0.9146425724029541, 0.6747556924819946, 0.38522374629974365, 0.15905532240867615, 0.0]
+    });
 
     let mut gen = h3_rs::rng::TorchGen::new(42);
     let nv = gen.randn_tensor(&video_shape, &dev)?;
@@ -152,12 +152,29 @@ fn main() -> anyhow::Result<()> {
         None,
         |step, total| {
             let step_ms = last_t.elapsed().as_secs_f64() * 1000.0;
-            println!("[w4a4-1080p] Step {}/{} completed in {:.2}ms ({:.2}s)", step, total, step_ms, step_ms / 1000.0);
+            println!("[w4a4-1080p] Step {}/{} completed in {:.2}ms ({:.2}s)", step + 1, total, step_ms, step_ms / 1000.0);
             last_t = Instant::now();
             Ok(())
         },
     )?;
     println!("[w4a4-1080p] All 6 steps finished in {:.2}s", t0.elapsed().as_secs_f64());
+
+    let dv_f = sampled.denoised_v.to_dtype(DType::F32)?;
+    let dv_mean = dv_f.mean_all()?.to_scalar::<f32>()?;
+    let dv_rms = dv_f.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
+    let dv_centered = (&dv_f - dv_mean as f64)?;
+    let dv_var = dv_centered.sqr()?.mean_all()?.to_scalar::<f32>()?;
+    let dv_std = dv_var.sqrt();
+    println!("=== 1080P SAMPLED VIDEO LATENT STATS ===");
+    println!("mean: {:.5}, rms: {:.5}, std: {:.5}", dv_mean, dv_rms, dv_std);
+
+    let f0 = dv_f.narrow(2, 0, 1)?;
+    let h = f0.dim(3)?;
+    let w = f0.dim(4)?;
+    let diff_h = (&f0.narrow(3, 1, h - 1)? - &f0.narrow(3, 0, h - 1)?)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+    let diff_w = (&f0.narrow(4, 1, w - 1)? - &f0.narrow(4, 0, w - 1)?)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+    println!("=== SPATIAL DIFFERENCE PROBE ===");
+    println!("f0 diff_h: {:.4}, diff_w: {:.4}", diff_h, diff_w);
 
     let mut out_file = File::create(&out_path)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_v)?;

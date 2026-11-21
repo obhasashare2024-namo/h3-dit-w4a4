@@ -1076,9 +1076,10 @@ impl Dit {
         let s = n1.dim(0)?;
         let inner = h * d;
         let att_bytes_calc = s * inner * 2;
+        let force_gpu_att = std::env::var("H3_FORCE_GPU_ATT").map(|v| v == "1" || v == "true").unwrap_or(false);
         let (offload_att, offload_mid) = if s > 30000 {
             let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
-            let offload_att = s > 140000 || free_vram_start < att_bytes_calc + 1_000_000_000;
+            let offload_att = !force_gpu_att && (s > 140000 || free_vram_start < att_bytes_calc + 1_000_000_000);
             let att_bytes = if !offload_att { att_bytes_calc } else { 0 };
             let needed_mid_bytes = 3 * s * 768 * 2;
             let offload_mid = s > 140000 || free_vram_start < needed_mid_bytes + att_bytes + 500_000_000;
@@ -1192,7 +1193,8 @@ impl Dit {
         };
         let (free_vram_att, _) = crate::config::vram_info().unwrap_or((0, 0));
         let att_bytes_calc = s * inner * 2;
-        let offload_att = s > 140000 || (s > 30000 && free_vram_att < att_bytes_calc + 1_000_000_000);
+        let force_gpu_att = std::env::var("H3_FORCE_GPU_ATT").map(|v| v == "1" || v == "true").unwrap_or(false);
+        let offload_att = !force_gpu_att && (s > 140000 || (s > 30000 && free_vram_att < att_bytes_calc + 1_000_000_000));
         println!("[attend_grouped_qkv] start: s={}, groups={}, w={}, offload_att={}", s, groups, w, offload_att);
         let pinned_att = if offload_att {
             println!("[attend_grouped_qkv] Using Phase 3.2b-lite Pinned Host Attention Buffer (Zero CPU Cat)");

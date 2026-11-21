@@ -806,16 +806,18 @@ pub struct Raw {
 impl Raw {
     /// Output rows `[r0, r0 + n)` of an int8 or w4a4 weight (pairs with [`QLinear::rows`]).
     pub fn rows(&self, r0: usize, n: usize) -> Result<Raw> {
-        if self.bs.is_some() {
-            bail!("row slices of block-scaled weights are not supported");
-        }
+        let bs = if let Some(ref b) = self.bs {
+            Some(b.narrow(0, r0, n)?.contiguous()?)
+        } else {
+            None
+        };
         if self.w.rank() == 4 {
             if r0 % 8 != 0 || n % 8 != 0 {
                 bail!("AmpereW4A4Preswizzled row slice requires r0 and n to be multiples of 8 (got r0={r0}, n={n})");
             }
-            Ok(Raw { w: self.w.narrow(0, r0 / 8, n / 8)?.contiguous()?, bs: None })
+            Ok(Raw { w: self.w.narrow(0, r0 / 8, n / 8)?.contiguous()?, bs })
         } else {
-            Ok(Raw { w: self.w.narrow(0, r0, n)?.contiguous()?, bs: None })
+            Ok(Raw { w: self.w.narrow(0, r0, n)?.contiguous()?, bs })
         }
     }
 }
@@ -1013,13 +1015,19 @@ impl QLinear {
     /// This layer restricted to output rows `[r0, r0 + n)`: the same linear for a head group of a fused
     /// projection, to run against [`Raw::rows`]. Needs no LoRA deltas and a plain (int8 / dense) weight.
     pub fn rows(&self, r0: usize, n: usize, dev: &Device) -> Result<QLinear> {
-        if !self.loras.is_empty() || self.interleaved || self.block_scale.is_some() {
+        if !self.loras.is_empty() || self.interleaved {
             bail!("{}: cannot slice rows of this layer", self.name);
         }
         let mut l = self.clone();
         l.out_features = n;
-        if matches!(self.fmt, QFormat::Dense | QFormat::GgufQuant { .. }) {
-            let w = self.weight.get(dev)?;
+        let w = self.weight.get(dev)?;
+        if w.rank() == 4 {
+            if r0 % 8 != 0 || n % 8 != 0 {
+                bail!("AmpereW4A4Preswizzled row slice requires r0 and n to be multiples of 8 (got r0={r0}, n={n})");
+            }
+            let w_slice = w.narrow(0, r0 / 8, n / 8)?.contiguous()?;
+            l.weight = Held::from_tensor(w_slice);
+        } else {
             let w_slice = w.narrow(0, r0, n)?.contiguous()?;
             l.weight = Held::from_tensor(w_slice);
         }
@@ -1032,6 +1040,11 @@ impl QLinear {
                 let rows = t.narrow(0, r0, n)?.contiguous()?;
                 l.scale = Some(Held::from_tensor(rows));
             }
+        }
+        if let Some(bs) = &self.block_scale {
+            let t = bs.get(dev)?;
+            let rows = t.narrow(0, r0, n)?.contiguous()?;
+            l.block_scale = Some(Held::from_tensor(rows));
         }
         l.bias = self.bias.as_ref().map(|b| b.narrow(0, r0, n).and_then(|t| t.contiguous())).transpose()?;
         Ok(l)
