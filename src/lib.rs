@@ -29,6 +29,7 @@ pub mod media;
 pub mod ops;
 pub mod pipeline;
 pub mod progress;
+pub mod radial_mask;
 pub mod rng;
 pub mod sampling;
 #[cfg(feature = "serve")]

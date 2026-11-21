@@ -1469,7 +1469,18 @@ impl Dit {
                 }
             }
         };
-        let (n1, x_saved, x_holder, dev_ref) = if x.dim(0)? > 30000 {
+        let (free_vram_now, _) = crate::config::vram_info().unwrap_or((0, 0));
+        let zero_offload_env = std::env::var("H3_ZERO_OFFLOAD").map(|v| v != "0" && v != "false");
+        let use_zero_offload = zero_offload_env.unwrap_or(free_vram_now >= 2_000_000_000);
+
+        let (n1, x_saved, x_holder, dev_ref) = if use_zero_offload {
+            let x_h = Some(x);
+            let n1 = {
+                let x_ref = x_h.as_ref().unwrap();
+                prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?
+            };
+            (n1, None, x_h, dev)
+        } else if x.dim(0)? > 30000 {
             println!("[dit] run_block: offloading x to PINNED HOST DMA (IN-PLACE NORM1), free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let s_dim = x.dim(0)?;
             let hidden_dim = x.dim(1)?;
