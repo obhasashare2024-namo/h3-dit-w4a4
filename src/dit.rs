@@ -1079,12 +1079,16 @@ impl Dit {
         let inner = h * d;
         let att_bytes_calc = s * inner * 2;
         let force_gpu_att = std::env::var("H3_FORCE_GPU_ATT").map(|v| v == "1" || v == "true").unwrap_or(false);
+        println!("[attend_factorized] entered: s={}, free VRAM={:.2} GB", s, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
         let (offload_att, offload_mid) = if s > 30000 {
             let (free_vram_start, _) = crate::config::vram_info().unwrap_or((0, 0));
             let offload_att = !force_gpu_att && (s > 140000 || free_vram_start < att_bytes_calc + 1_000_000_000);
             let att_bytes = if !offload_att { att_bytes_calc } else { 0 };
-            let needed_mid_bytes = 3 * s * 768 * 2;
-            let offload_mid = s > 140000 || free_vram_start < needed_mid_bytes + att_bytes + 500_000_000;
+            let mid_dim = q.down.out_features + k.down.out_features + v.down.out_features;
+            let needed_mid_bytes = s * mid_dim * 2;
+            let offload_mid = s > 140000 || free_vram_start < needed_mid_bytes + att_bytes + 1_000_000_000;
+            println!("[attend_factorized] s={}, free VRAM={:.2} GB, mid_dim={}, needed_mid={:.2} GB, offload_att={}, offload_mid={}",
+                s, free_vram_start as f64 / 1e9, mid_dim, needed_mid_bytes as f64 / 1e9, offload_att, offload_mid);
             (offload_att, offload_mid)
         } else {
             (false, false)
@@ -1102,7 +1106,9 @@ impl Dit {
             let mid_v = mid_v_cpu.to_device(&self.dev)?;
             (mid_q, mid_k, mid_v)
         } else {
+            println!("[attend_factorized] before q.down, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let mid_q = prof::time("q down", &self.dev, || q.down.forward_chunked(&n1, chunk))?;
+            println!("[attend_factorized] before k.down, free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let mid_k = prof::time("k down", &self.dev, || k.down.forward_chunked(&n1, chunk))?;
             let mid_v = prof::time("v down", &self.dev, || v.down.forward_chunked(&n1, chunk))?;
             drop(n1);
@@ -1474,10 +1480,14 @@ impl Dit {
         let use_zero_offload = zero_offload_env.unwrap_or(free_vram_now >= 2_000_000_000);
 
         let (n1, x_saved, x_holder, dev_ref) = if use_zero_offload {
+            println!("[dit] run_block: ZERO ACTIVATION OFFLOAD (X persistent on GPU), free VRAM={:.2} GB", free_vram_now as f64 / 1e9);
             let x_h = Some(x);
             let n1 = {
                 let x_ref = x_h.as_ref().unwrap();
-                prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?
+                println!("[dit] before rms_modulate: free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+                let res = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(x_ref, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?;
+                println!("[dit] after rms_modulate: free VRAM={:.2} GB", crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
+                res
             };
             (n1, None, x_h, dev)
         } else if x.dim(0)? > 30000 {
@@ -2167,7 +2177,7 @@ impl Dit {
         let curve = self.adaln_t_table.is_some();
         let hidden = self.cfg.hidden;
         let inner = self.cfg.heads * self.cfg.head_dim;
-        let persistent_att_full = if dev.is_cuda() && std::env::var("H3_FORCE_GPU_ATT").map(|v| v == "1" || v == "true").unwrap_or(true) {
+        let persistent_att_full = if dev.is_cuda() && std::env::var("H3_FORCE_GPU_ATT").map(|v| v == "1" || v == "true").unwrap_or(false) && layout.seq_len <= 30000 {
             Some(Tensor::zeros((x.dim(0)?, inner), self.dtype, dev)?)
         } else {
             None
@@ -2215,6 +2225,7 @@ impl Dit {
                 };
 
                 let raw_weights = raws.as_ref().map(|(_, r)| r.clone());
+                println!("[dit] starting block bi={}, free VRAM={:.2} GB", bi, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
                 x = self.run_block(b, raw_weights, x, &cx)?;
 
                 if let Some((off_idx, _)) = raws {
