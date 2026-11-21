@@ -45,19 +45,28 @@ fn write_edlat_tensor<W: Write>(w: &mut W, t: &Tensor) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    std::env::set_var("H3_ATTN", "attn8");
+    std::env::set_var("H3_ATTN_GROUPS", "14");
+    std::env::set_var("H3_STREAMING", "0");
+    std::env::set_var("H3_FORCE_GPU_ATT", "1");
+
     let dev = Device::new_cuda(0)?;
-    let model_path = "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_flash_14b_w4a4_preswizzled.safetensors";
+    let input_bundle = std::env::args().nth(1).unwrap_or_else(|| "/mnt/2tbnvS/tmp/stage1_input_1080p_8s.edbin".to_string());
+    let model_path = std::env::args().nth(2).unwrap_or_else(|| "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_50b_w4a4_preswizzled.safetensors".to_string());
+
     let mut mem = MemoryConfig::default();
-    mem.dit_gpu_blocks = 22;
-    mem.dit_vram_blocks = 22;
-    mem.dit_ram_blocks = 25;
+    mem.dit_gpu_blocks = 0;
+    mem.dit_vram_blocks = 0;
+    mem.dit_ram_blocks = if model_path.contains("50b") || model_path.contains("w4a8") { 50 } else { 48 };
     mem.dit_disk_blocks = 0;
-    mem.offload = h3_rs::weights::Placement::Disk;
+    mem.offload = h3_rs::weights::Placement::Ram;
+    mem.token_chunk = 4096;
+    mem.mlp_chunk = 2048;
 
-    println!("Loading DiT...");
-    let dit = Dit::load(model_path, &dev, &mem, None)?;
+    println!("Loading DiT: {}...", model_path);
+    let dit = Dit::load(&model_path, &dev, &mem, None)?;
 
-    let mut f = File::open("/mnt/R2D/tmp/minimax_bridge/stage1_input_3s.edbin")?;
+    let mut f = File::open(&input_bundle)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     let mut header = [0i32; 4];
@@ -104,7 +113,9 @@ fn main() -> anyhow::Result<()> {
 
     let video_shape = vid_lat.dims().to_vec();
     let audio_t = aud_lat.dim(3)?;
-    let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| h3_rs::sampling::simple_sigmas(shifts[0] as f64, 6));
+    let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| {
+        vec![1.0, 0.982655942440033, 0.9146425724029541, 0.6747556924819946, 0.38522374629974365, 0.15905532240867615, 0.0]
+    });
 
     let mut gen = h3_rs::rng::TorchGen::new(42);
     let nv = gen.randn_tensor(&video_shape, &dev)?;

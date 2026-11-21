@@ -61,7 +61,12 @@ fn main() -> anyhow::Result<()> {
     println!("[gguf-q3km-e2e] Loading GGUF Q3_K_M DiT with Zero-Disk Placement: {}", model_path);
     let dit = Dit::load(model_path, &dev, &mem, None)?;
 
-    let mut f = File::open("/mnt/R2D/tmp/minimax_bridge/stage1_input_3s.edbin")?;
+    let args: Vec<String> = std::env::args().collect();
+    let input_path = if args.len() > 1 { args[1].clone() } else { "/mnt/2tbnvS/tmp/stage1_input_1080p_8s.edbin".to_string() };
+    let out_path = if args.len() > 2 { args[2].clone() } else { "/mnt/2tbnvS/tmp/h3_q3km_e2e_1080p_8s.edlat".to_string() };
+    println!("[gguf-q3km-e2e] Input bundle: {}", input_path);
+    println!("[gguf-q3km-e2e] Output edlat: {}", out_path);
+    let mut f = File::open(&input_path)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     let mut header = [0i32; 4];
@@ -140,8 +145,8 @@ fn main() -> anyhow::Result<()> {
     let total_elapsed = t0.elapsed().as_secs_f64();
     println!("[gguf-q3km-e2e] All 6 steps finished in {:.2}s (avg {:.2}s/step)", total_elapsed, total_elapsed / 6.0);
 
-    let out_path = "/mnt/2tbnvS/tmp/h3_q3km_e2e_3s.edlat";
-    let mut out_file = File::create(out_path)?;
+    // out_path handled above
+    let mut out_file = File::create(&out_path)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_v)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_a)?;
     println!("[gguf-q3km-e2e] Saved multi-modal sampled latents to {out_path}");

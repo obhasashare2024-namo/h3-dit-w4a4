@@ -47,19 +47,29 @@ fn write_edlat_tensor<W: Write>(w: &mut W, t: &Tensor) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    std::env::set_var("H3_ATTN", "attn8");
+    std::env::set_var("H3_FORCE_GPU_ATT", "1");
     let dev = Device::new_cuda(0)?;
-    let model_path = "/mnt/2tbnvS/models/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors";
+    let args: Vec<String> = std::env::args().collect();
+    let input_path = if args.len() > 1 { args[1].clone() } else { "/mnt/2tbnvS/tmp/stage1_input_1080p_8s.edbin".to_string() };
+    let out_path = if args.len() > 2 { args[2].clone() } else { "/mnt/2tbnvS/tmp/h3_w4a8_e2e_1080p_8s.edlat".to_string() };
+    let model_path = if args.len() > 3 { args[3].clone() } else { "/mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_w4a8_preswizzled.safetensors".to_string() };
+
     let mut mem = MemoryConfig::default();
-    mem.dit_gpu_blocks = 18;
-    mem.dit_vram_blocks = 18;
-    mem.dit_ram_blocks = 32;
+    mem.dit_gpu_blocks = 0;
+    mem.dit_vram_blocks = 0;
+    mem.dit_ram_blocks = 50;
     mem.dit_disk_blocks = 0;
-    mem.offload = h3_rs::weights::Placement::Disk;
+    mem.offload = h3_rs::weights::Placement::Ram;
+    mem.token_chunk = 4096;
+    mem.mlp_chunk = 2048;
 
-    println!("[w4a8-e2e] Loading official W4A8 DiT...");
-    let dit = Dit::load(model_path, &dev, &mem, None)?;
+    println!("[w4a8-e2e] Loading W4A8 DiT with Zero-VRAM Offload Placement: {}", model_path);
+    println!("[w4a8-e2e] Input bundle: {}", input_path);
+    println!("[w4a8-e2e] Output edlat: {}", out_path);
+    let dit = Dit::load(&model_path, &dev, &mem, None)?;
 
-    let mut f = File::open("/mnt/R2D/tmp/minimax_bridge/stage1_input_3s.edbin")?;
+    let mut f = File::open(&input_path)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     let mut header = [0i32; 4];
@@ -106,7 +116,10 @@ fn main() -> anyhow::Result<()> {
 
     let video_shape = vid_lat.dims().to_vec();
     let audio_t = aud_lat.dim(3)?;
-    let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| simple_sigmas(shifts[0] as f64, 6));
+    let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| {
+        println!("[w4a8-e2e] Using HyperFlow 6-step distillation schedule");
+        vec![1.0, 0.982655942440033, 0.9146425724029541, 0.6747556924819946, 0.38522374629974365, 0.15905532240867615, 0.0]
+    });
 
     let mut gen = h3_rs::rng::TorchGen::new(42);
     let nv = gen.randn_tensor(&video_shape, &dev)?;
@@ -130,15 +143,14 @@ fn main() -> anyhow::Result<()> {
         None,
         |step, total| {
             let step_ms = last_t.elapsed().as_secs_f64() * 1000.0;
-            println!("[w4a8-e2e] Step {}/{} completed in {:.2}ms", step + 1, total, step_ms);
+            println!("[w4a8-e2e] Step {}/{} completed in {:.2}ms ({:.2}s)", step + 1, total, step_ms, step_ms / 1000.0);
             last_t = Instant::now();
             Ok(())
         },
     )?;
     println!("[w4a8-e2e] All 6 steps finished in {:.2}s", t0.elapsed().as_secs_f64());
 
-    let out_path = "/mnt/2tbnvS/tmp/h3_w4a8_e2e_3s.edlat";
-    let mut out_file = File::create(out_path)?;
+    let mut out_file = File::create(&out_path)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_v)?;
     write_edlat_tensor(&mut out_file, &sampled.denoised_a)?;
     println!("[w4a8-e2e] Saved multi-modal sampled latents to {out_path}");

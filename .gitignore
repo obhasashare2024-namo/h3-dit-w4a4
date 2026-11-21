@@ -1,4 +1,8 @@
 target/
 out/
-dit_9411.log
-dit_*.log
+*.log
+*.qdrep
+*.sqlite
+*.bak*
+*.bak/
+.bak/

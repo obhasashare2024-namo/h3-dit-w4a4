@@ -245,7 +245,12 @@ fn worker_loop(
 
             let video_shape = vid_lat.dims().to_vec();
             let audio_t = aud_lat.dim(3)?;
-            let sigmas = dit.hyperflow_sigmas.clone().unwrap_or_else(|| simple_sigmas(shifts[0] as f64, req.steps));
+            let sigmas = if req.steps == 6 && dit.hyperflow_sigmas.is_some() {
+                dit.hyperflow_sigmas.clone().unwrap()
+            } else {
+                simple_sigmas(shifts[0] as f64, req.steps)
+            };
+            println!("[server_9411] Configured steps={}, active sigmas count={}: {:?}", req.steps, sigmas.len(), sigmas);
 
             // Step 0 Gaussian Noise Initialization:
             // Standard ComfyUI RandomNoise: If input latent is empty/zero, initialize TorchGen noise scaled by sigma[0]

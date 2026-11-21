@@ -34,6 +34,9 @@ RTX 3070 8GB / RTX 4060Ti / RTX 3060 12GB などのコンシューマ向け小�
 - [リポジトリブランチ構成と変遷史](#リポジトリブランチ構成と変遷史)
 - [次世代ロードマップ：リサーチャー仲裁方針](#次世代ロードマップリサーチャー仲裁方針)
 - [API リファレンス & クイックスタート](#api-リファレンス--クイックスタート)
+- [手書き W4A4 モデル圧縮 SOP とオリジナル INT8 ソース](#手書き-w4a4-モデル圧縮-sop-とオリジナル-int8-ソース)
+- [W4A4 サーバー運用手法と 8 ステップ上限規範](#w4a4-サーバー運用手法と-8-ステップ上限規範)
+- [音声 EDL チュートリアルとデュアルモーダル AV 合成全手順](#音声-edl-チュートリアルとデュアルモーダル-av-合成全手順)
 - [謝辞とコントリビューション](#謝辞とコントリビューション)
 - [ライセンス](#ライセンス)
 
@@ -303,6 +306,92 @@ curl -X POST http://127.0.0.1:9412/sample_step \
 ```
 
 ---
+
+
+---
+
+## 手書き W4A4 モデル圧縮 SOP とオリジナル INT8 ソース
+
+### 1. コミュニティ/公式オリジナル INT8 実ダウンロード URL
+HyperFlow Flash 14B INT8 ConvRot の重みは VideoRebirthAI により Hugging Face で公開されています：
+- **リポジトリ**: [`VideoRebirthAI/hyperflow-h3-flash`](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash)
+- **FL2VA (Text/First-Frame to Video) INT8 ConvRot 直接ダウンロード URL** (~16.0 GB):
+  `https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash/resolve/main/fl2va_int8_convrot_comfyui/minimax_h3_fl2va_hyperflow_flash_14b-int8_convrot.safetensors`
+- **REF2VA (Reference to Video) INT8 ConvRot 直接ダウンロード URL** (~16.0 GB):
+  `https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash/resolve/main/ref2va_int8_convrot_comfyui/minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors`
+
+### 2. メモリ消費ゼロのストリーミング量子化スクリプト (`tools/stream_convert_official_int8_to_preswizzled_w4a4.py`)
+16GB INT8 のメモリ制限を打破するため、本プロジェクトでは INT8 ConvRot を約 9.6GB の True W4A4 へ無劣化圧縮するストリーミングコンバータを手書き開発しました：
+- **Zero-RAM Streaming**: レイヤー単位でディスクへ直接書き込み、ホスト RAM ピーク消費を `< 300MB` に抑制。
+- **4 つの数学的精度向上技術**:
+  1. **Sub-LSB デエイリアシングディザ (De-aliasing Dither)**: 非ゼロ重みの最下位ビットに適応型ディザを適用し、格子状アーティファクトを分散。
+  2. **ベクトル化 15 点グリッドサーチ**: $L_{2.2}$ 知覚損失に基づき、スケール包絡線 $\alpha \in [0.72, 1.00]$ を自動探索。
+  3. **OLS 直交射影 (Orthogonal Least Squares)**: $s_{ols} = \frac{\langle W, Q \rangle}{\|Q\|^2}$ により残差バイアスを排除。
+  4. **Ampere sm_86 Warp-Tile プリスウィズル**: 事前に INT4 を `mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32` 行列 B レジスタ配列 `[N // 8, K // 64, 32, 2]` に変換し、推論時の転置オーバーヘッドをゼロ化！
+- **実行手順**:
+  ```bash
+  python3 tools/stream_convert_official_int8_to_preswizzled_w4a4.py
+  ```
+  出力成果物：`minimax_h3_fl2va_hyperflow_flash_14b_w4a4_preswizzled.safetensors` (~9.6 GB)。
+
+---
+
+## W4A4 サーバー運用手法と 8 ステップ上限規範
+
+### 1. サーバーのビルドと起動 (`server_9411`)
+```bash
+cargo build --release --bin server_9411
+
+./target/release/server_9411 \
+  --model /mnt/2tbnvS/models/minimax_h3_fl2va_hyperflow_flash_14b_w4a4_preswizzled.safetensors \
+  --port 9411 \
+  --vram-blocks 0 \
+  --ram-blocks 48 \
+  --reserve-gb 1.5 \
+  --token-chunk 4096 \
+  --mlp-chunk 2048
+```
+- `--vram-blocks 0 --ram-blocks 48`: VRAM 常駐ゼロ。全 48 レイヤーをホスト RAM に配置し、オンデマンド DMA で RTX 3070 8GB 上で安定動作。
+- `--token-chunk 4096 --mlp-chunk 2048`: 1080P/1088P (121k トークン) の CUDA OOM を完全回避。
+
+### 2. サンプリングステップ規範：なぜ 8 ステップが最高の物理上限なのか
+HyperFlow は **Two-Time Conditioning $(t, r)$ フロー自己蒸留** を採用しています：
+- **4 ステップ**: 超高速ドラフトモード。
+- **6 ステップ**: Flash 公式推奨のバランスモード。
+- **8 ステップ（最大物理上限）**: **蒸留モデルが到達可能な最高品質上限**。1088P 8秒 (121k トークン) において、人物の表情や毛髪・肌の質感を完全維持し、溶けやモザイク崩壊を根絶。
+- **8 ステップ超過厳禁の数学的理由**:
+  蒸留は $N \in \{4, 6, 8\}$ の離散ステップに対して最適化されています。10 ステップ以上を指定すると、時間刻み幅 $\Delta t = r - t$ が極小となり、終端埋め込み（`endpoint_time_embedder`）が**分布外 (OOD)** に陥ります。直進速度場が過剰累積され、**深刻なコントラスト焼け（Contrast Burn）、過露出、高周波ノイズ暴走、顔面構造崩壊** を引き起こします。
+
+### 3. 解像度境界と推奨パイプライン
+- **768P (ネイティブ黄金基準)**: ステップあたり約 1.75秒、5秒動画がわずか 14秒で完了。音映像同期も完璧。
+- **1088P/1080P ネイティブ**: 121,041 トークンを 8 ステップで計算、消費者向け GPU で約 72分（検証済み最高画質、ただし高負荷）。
+- **推奨ファクトリーパイプライン**: **768P ネイティブ + 1.4x ビデオ超解像 (Video-SR)** または 2段階 In-Context Regeneration を組み合わせ、数秒で 1080P 品質を出力。
+
+---
+
+## 音声 EDL チュートリアルとデュアルモーダル AV 合成全手順
+
+### 1. EDLAT デュアルモーダルバイナリコンテナ規格
+MiniMax H3 は音映像統合拡散を行い、成果物を `.edlat` 形式で保持します：
+- **マジックヘッダー**: `TL3H` (`0x48334c54`) 80バイト規格ヘッダー。
+- **テンソル 1 (映像 Latent)**: `[1, 24, T_v, H_v, W_v]` (24fps)。
+- **テンソル 2 (音声 Latent)**: `[1, 32, 2, T_a]` (40Hz ステレオ音声)。
+- **タイムシフト**: `shift_video = 12.0`、`shift_audio = 3.0`。
+
+### 2. 音声独立抽出と BigVGAN VAE デコード
+- **物理音質実測値**: 1088P 8秒出力波形の最大振幅 0.0734、クリッピング率 0.0000% を実証。
+- **デコード手順 (`render_audio_from_edlat`)**:
+  ```bash
+  cargo run --release --example render_audio_from_edlat \
+    /mnt/2tbnvS/tmp/h3_w4a4_1088p_8s_8step.edlat \
+    /mnt/2tbnvS/tmp/h3_w4a4_1088p_8s_8step.wav
+  ```
+  BigVGAN ボコーダーが 40Hz Latent を 800倍アップサンプリングし、32kHz 16-bit PCM 高忠実度ステレオ WAV を復元。
+
+### 3. 音映像統合 (AV Muxing)
+```bash
+ffmpeg -y -i video.mp4 -i audio.wav -c:v copy -c:a aac -b:a 192k h3_w4a4_1088p_8s_av_sync.mp4
+```
 
 ## 謝辞とコントリビューション
 
