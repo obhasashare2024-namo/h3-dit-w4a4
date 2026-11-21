@@ -201,6 +201,7 @@ For long sequences ($S > 85,000$), the engine enforces strict memory synchroniza
 | **5 Seconds** | 80,015 tokens | 592.80 s | 300.60 s | **300.60 s** | **1.97x** | -292.20 s | Pure GPU In-Place Col-Copy |
 | **8 Seconds (Phase 4A)** | 121,041 tokens | 910.15 s | 607.34 s | **530.29 s** (Attn8) | **1.72x** | -379.86 s | INT4 MMA + Attn8 Lazy Rescaling |
 | **8 Seconds (FA2 Production)** | 121,041 tokens | 910.15 s | 621.57 s | **508.44 s** 🏆 | **1.79x** | **-401.71 s** | Pure Rust W4A4 + FA2 FP16 Exact Ground Truth |
+| **8s 8-Step (Milestone 6.2)** | 121,041 tokens | 543.54 s/step (4348.32 s) | 520.15 s | **511.51 s/step (4092.06 s)** 🏆 | **1.06x** | **-256.26 s** | Full E2E W4A4 + FA2 + Persistent GPU Attn Buffer |
 | **12s (80W)** | 182,581 tokens | 1436.00 s | 1376.29 s | **1376.29 s** | **1.06x** | -59.71 s | Phase 3.2b-lite Pinned Stream |
 | **12s (125W)** | 182,581 tokens | 1436.00 s | 1155.95 s | **1155.95 s** | **1.27x** | -311.35 s | Phase 3.3 Power/Clock Released |
 | **12s (FA2 Production)** | 182,581 tokens | 1436.00 s | 1092.05 s | **1092.05 s** 🏆 | **1.34x** | **-375.25 s** | FA2 FP16 Pure Ground Truth Production Baseline |

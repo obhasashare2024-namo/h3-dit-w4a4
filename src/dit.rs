@@ -438,6 +438,7 @@ pub(crate) struct StepCtx<'a> {
     pub idx: &'a Tensor,
     pub rope: &'a Tensor,
     pub u: usize,
+    pub att_full: Option<&'a Tensor>,
 }
 
 struct RefinerBlock {
@@ -1070,6 +1071,7 @@ impl Dit {
         rot: usize,
         groups: usize,
         chunk: usize,
+        persistent_att: Option<&Tensor>,
     ) -> Result<AttResult> {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let (hg, w) = (h / groups, h / groups * d);
@@ -1113,7 +1115,9 @@ impl Dit {
             None
         };
 
-        let att_full = if !offload_att {
+        let att_full = if let Some(buf) = persistent_att {
+            Some(buf.clone())
+        } else if !offload_att {
             Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
         } else {
             None
@@ -1182,7 +1186,7 @@ impl Dit {
         }
     }
 
-    fn attend_grouped_qkv(&self, qkv: &QLinear, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<AttResult> {
+    fn attend_grouped_qkv(&self, qkv: &QLinear, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize, persistent_att: Option<&Tensor>) -> Result<AttResult> {
         let (h, d) = (self.cfg.heads, self.cfg.head_dim);
         let inner = h * d;
         let (hg, w) = (h / groups, h / groups * d);
@@ -1202,8 +1206,9 @@ impl Dit {
         } else {
             None
         };
-        let att_full = if !offload_att {
-            println!("[attend_grouped_qkv] Preallocating att_full on GPU: [{}, {}]", s, inner);
+        let att_full = if let Some(buf) = persistent_att {
+            Some(buf.clone())
+        } else if !offload_att {
             Some(Tensor::zeros((s, inner), self.dtype, &self.dev)?)
         } else {
             None
@@ -1512,7 +1517,7 @@ impl Dit {
                     Some([r, ..]) => r.clone(),
                     None => qkv.fetch(dev)?,
                 };
-                self.attend_grouped_qkv(qkv, b, n1, &r_qkv, cx.rope, rot, groups, chunk)?
+                self.attend_grouped_qkv(qkv, b, n1, &r_qkv, cx.rope, rot, groups, chunk, cx.att_full)?
             }
             QkvProj::Fused(qkv) => {
                 let qkv_t = prof::time("qkv linear", dev, || match &raws {
@@ -1525,7 +1530,7 @@ impl Dit {
                 AttResult::Gpu(att)
             }
             QkvProj::Factorized { q, k, v } => {
-                self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups, chunk)?
+                self.attend_factorized(q, k, v, b, n1, cx.rope, rot, groups, chunk, cx.att_full)?
             }
         };
 
@@ -2150,7 +2155,13 @@ impl Dit {
         let t_emb = self.time_embed(&unique, r_vals.as_deref())?; // [U, t_dim] f32
         let curve = self.adaln_t_table.is_some();
         let hidden = self.cfg.hidden;
-        let cx = StepCtx { t_emb: &t_emb, curve, idx: &idx, rope: &run.rope, u: unique.len() };
+        let inner = self.cfg.heads * self.cfg.head_dim;
+        let persistent_att_full = if dev.is_cuda() && std::env::var("H3_FORCE_GPU_ATT").map(|v| v == "1" || v == "true").unwrap_or(true) {
+            Some(Tensor::zeros((x.dim(0)?, inner), self.dtype, dev)?)
+        } else {
+            None
+        };
+        let cx = StepCtx { t_emb: &t_emb, curve, idx: &idx, rope: &run.rope, u: unique.len(), att_full: persistent_att_full.as_ref() };
         #[cfg(feature = "cuda")]
         if let Some(engine) = &self.streaming {
             let step_id = engine.begin_step_and_prime()?;
