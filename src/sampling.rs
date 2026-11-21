@@ -65,6 +65,15 @@ pub fn sample_denoised(
     let n = sigmas.len() - 1;
     let mut last: Option<(Tensor, Tensor)> = None;
     for i in 0..n {
+        if let Ok(hybrid) = std::env::var("H3_HYBRID_WINDOW") {
+            if i == 0 {
+                std::env::remove_var("H3_ATTN_WINDOW");
+                println!("[sampling] Step {}/{}: Dense FA-2 (Global Semantic Lock-in)", i + 1, n);
+            } else {
+                std::env::set_var("H3_ATTN_WINDOW", &hybrid);
+                println!("[sampling] Step {}/{}: Windowed FA-2 (H3_ATTN_WINDOW={})", i + 1, n, hybrid);
+            }
+        }
         let (s, s_next) = (sigmas[i], sigmas[i + 1]);
         let (ov, oa, dv, da);
         let (sv, sa) = (dit.cfg.shift_video, dit.cfg.shift_audio);
