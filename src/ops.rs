@@ -62,6 +62,13 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Ten
     {
         if q.device().is_cuda() && matches!(q.dtype(), DType::F16 | DType::BF16) && d <= 256 {
             let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
+            if let Ok(w_str) = std::env::var("H3_ATTN_WINDOW") {
+                if let Ok(w) = w_str.parse::<usize>() {
+                    if w > 0 && q.dim(1)? > w {
+                        return Ok(candle_flash_attn::flash_attn_windowed(&q, &k, &v, scale, Some(w), Some(w))?);
+                    }
+                }
+            }
             return Ok(candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)?);
         }
     }
