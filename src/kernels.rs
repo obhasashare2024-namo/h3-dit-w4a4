@@ -1766,7 +1766,7 @@ fn grid_for(n: usize) -> LaunchConfig {
 }
 
 /// Raw device pointer (as u64) of a storage, honoring the layout start offset.
-fn dev_ptr(st: &CudaStorage, l: &Layout) -> Result<u64> {
+pub(crate) fn dev_ptr(st: &CudaStorage, l: &Layout) -> Result<u64> {
     use candle_core::cuda_backend::CudaStorageSlice as S;
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     let stream = st.device().cuda_stream();
@@ -2929,10 +2929,20 @@ pub fn gather_groups_to_rows_inplace(dst: &Tensor, src: &Tensor, g: usize, w: us
 }
 
 pub fn copy_tensor_to_host_pinned_async(t: &Tensor, dst_host: *mut u8) -> Result<()> {
-    let (st, l) = t.storage_and_layout();
+    let (st, _) = t.storage_and_layout();
     match &*st {
         Storage::Cuda(c) => {
             let stream = c.device.cuda_stream().cu_stream();
+            copy_tensor_to_host_pinned_async_stream(t, dst_host, stream)
+        }
+        _ => candle_core::bail!("needs cuda tensor"),
+    }
+}
+
+pub fn copy_tensor_to_host_pinned_async_stream(t: &Tensor, dst_host: *mut u8, stream: candle_core::cuda_backend::cudarc::driver::sys::CUstream) -> Result<()> {
+    let (st, l) = t.storage_and_layout();
+    match &*st {
+        Storage::Cuda(c) => {
             let p = dev_ptr(c, l)?;
             let bytes = t.elem_count() * t.dtype().size_in_bytes();
             unsafe {
@@ -2949,10 +2959,20 @@ pub fn copy_tensor_to_host_pinned_async(t: &Tensor, dst_host: *mut u8) -> Result
 }
 
 pub fn copy_host_pinned_to_tensor_offset_async(src_host: *const u8, t: &Tensor, dst_byte_offset: usize, bytes: usize) -> Result<()> {
-    let (st, l) = t.storage_and_layout();
+    let (st, _) = t.storage_and_layout();
     match &*st {
         Storage::Cuda(c) => {
             let stream = c.device.cuda_stream().cu_stream();
+            copy_host_pinned_to_tensor_offset_async_stream(src_host, t, dst_byte_offset, bytes, stream)
+        }
+        _ => candle_core::bail!("needs cuda tensor"),
+    }
+}
+
+pub fn copy_host_pinned_to_tensor_offset_async_stream(src_host: *const u8, t: &Tensor, dst_byte_offset: usize, bytes: usize, stream: candle_core::cuda_backend::cudarc::driver::sys::CUstream) -> Result<()> {
+    let (st, l) = t.storage_and_layout();
+    match &*st {
+        Storage::Cuda(c) => {
             let p = dev_ptr(c, l)? + dst_byte_offset as u64;
             unsafe {
                 use candle_core::cuda_backend::cudarc::driver::sys;

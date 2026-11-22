@@ -491,6 +491,8 @@ pub struct Dit {
     pub streaming: Option<crate::streaming::StreamingEngine>,
     #[cfg(feature = "cuda")]
     pub(crate) offload_x_pinned: std::sync::Mutex<Option<crate::streaming::ContiguousPinnedBuffer>>,
+    #[cfg(feature = "cuda")]
+    pub(crate) copy_stream: Option<candle_core::cuda_backend::cudarc::driver::sys::CUstream>,
 }
 
 /// Conditioning for one sampling run.
@@ -835,6 +837,21 @@ impl Dit {
             streaming,
             #[cfg(feature = "cuda")]
             offload_x_pinned: std::sync::Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            copy_stream: if dev.is_cuda() {
+                use candle_core::cuda_backend::cudarc::driver::sys;
+                let mut s: sys::CUstream = std::ptr::null_mut();
+                unsafe {
+                    let res = sys::cuStreamCreate(&mut s, sys::CUstream_flags_enum::CU_STREAM_NON_BLOCKING as u32);
+                    if res == sys::CUresult::CUDA_SUCCESS {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            },
             cfg,
         };
         if let Some((l, strength)) = lora {
@@ -1220,6 +1237,7 @@ impl Dit {
             None
         };
         let mut outs = if offload_att && pinned_att.is_none() { Vec::with_capacity(groups) } else { Vec::new() };
+        let mut prev_o: Option<(Tensor, candle_core::cuda_backend::cudarc::driver::sys::CUevent)> = None;
         for g in 0..groups {
             println!("[attend_grouped_qkv] g={}: projecting q, free VRAM={:.2} GB", g, crate::config::vram_info().unwrap_or((0,0)).0 as f64 / 1e9);
             let qt = prof::time("qkv linear", &self.dev, || proj(0, g))?;
@@ -1256,10 +1274,49 @@ impl Dit {
                 kernels::copy_slice_col_inplace(full, &o, g * w)?;
                 drop(o);
             } else if let Some(ref pbuf) = pinned_att {
-                prof::time("d2h pinned o", &self.dev, || pbuf.write_group_async(g, &o))?;
-                drop(o);
+                #[cfg(feature = "cuda")]
+                if let (Device::Cuda(cd), Some(c_stream)) = (&self.dev, self.copy_stream) {
+                    use candle_core::cuda_backend::cudarc::driver::sys;
+                    let stream_compute = cd.cuda_stream().cu_stream();
+                    let mut ev_compute: sys::CUevent = std::ptr::null_mut();
+                    let mut ev_copy: sys::CUevent = std::ptr::null_mut();
+                    unsafe {
+                        sys::cuEventCreate(&mut ev_compute, sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32);
+                        sys::cuEventCreate(&mut ev_copy, sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32);
+                        sys::cuEventRecord(ev_compute, stream_compute);
+                        sys::cuStreamWaitEvent(c_stream, ev_compute, 0);
+                    }
+                    prof::time("d2h pinned o async", &self.dev, || pbuf.write_group_async_stream(g, &o, c_stream))?;
+                    unsafe {
+                        sys::cuEventRecord(ev_copy, c_stream);
+                        sys::cuEventDestroy_v2(ev_compute);
+                    }
+                    if let Some((_prev_tensor, prev_ev)) = prev_o.take() {
+                        unsafe {
+                            sys::cuEventSynchronize(prev_ev);
+                            sys::cuEventDestroy_v2(prev_ev);
+                        }
+                    }
+                    prev_o = Some((o, ev_copy));
+                } else {
+                    prof::time("d2h pinned o", &self.dev, || pbuf.write_group_async(g, &o))?;
+                    drop(o);
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    prof::time("d2h pinned o", &self.dev, || pbuf.write_group_async(g, &o))?;
+                    drop(o);
+                }
             } else {
                 outs.push(o.to_device(&Device::Cpu)?);
+            }
+        }
+        if let Some((_prev_tensor, prev_ev)) = prev_o.take() {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use candle_core::cuda_backend::cudarc::driver::sys;
+                sys::cuEventSynchronize(prev_ev);
+                sys::cuEventDestroy_v2(prev_ev);
             }
         }
         println!("[attend_grouped_qkv] loop finished, dropping n1...");
@@ -1516,7 +1573,6 @@ impl Dit {
                         bail!("cuMemcpyDtoHAsync_v2 failed: {:?}", res);
                     }
                 }
-                dev.synchronize()?;
                 Ok(())
             })?;
             drop(pinned_lock);
@@ -1579,7 +1635,6 @@ impl Dit {
                         bail!("cuMemcpyHtoDAsync_v2 failed: {:?}", res);
                     }
                 }
-                dev_ref.synchronize()?;
                 Ok(())
             })?;
             drop(pinned_lock);
@@ -1592,6 +1647,127 @@ impl Dit {
             let (free_vram_out, _) = crate::config::vram_info().unwrap_or((0, 0));
             println!("[out linear pinned] start Phase 3.2b-lite in-place: s={}, groups={}, w={}, free VRAM={:.2} GB", s, pbuf.groups, pbuf.w, free_vram_out as f64 / 1e9);
             prof::time("out linear in-place pinned", dev, || -> Result<()> {
+                #[cfg(feature = "cuda")]
+                if let (Device::Cuda(cd), Some(c_stream)) = (dev, self.copy_stream) {
+                    use candle_core::cuda_backend::cudarc::driver::sys;
+                    let stream_compute = cd.cuda_stream().cu_stream();
+
+                    // Double-Buffered Pipelined Fetch & MMA Overlap
+                    let staging = [
+                        Tensor::zeros((pbuf.groups, chunk, pbuf.w), self.dtype, dev)?,
+                        Tensor::zeros((pbuf.groups, chunk, pbuf.w), self.dtype, dev)?,
+                    ];
+                    let gathered = [
+                        Tensor::zeros((chunk, pbuf.groups * pbuf.w), self.dtype, dev)?,
+                        Tensor::zeros((chunk, pbuf.groups * pbuf.w), self.dtype, dev)?,
+                    ];
+                    let (tail_staging, tail_gathered) = if s % chunk != 0 {
+                        let rem = s % chunk;
+                        (
+                            Some(Tensor::zeros((pbuf.groups, rem, pbuf.w), self.dtype, dev)?),
+                            Some(Tensor::zeros((rem, pbuf.groups * pbuf.w), self.dtype, dev)?),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let mut ev_copy: [sys::CUevent; 2] = [std::ptr::null_mut(), std::ptr::null_mut()];
+                    let mut ev_compute: [sys::CUevent; 2] = [std::ptr::null_mut(), std::ptr::null_mut()];
+                    unsafe {
+                        sys::cuEventCreate(&mut ev_copy[0], sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32);
+                        sys::cuEventCreate(&mut ev_copy[1], sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32);
+                        sys::cuEventCreate(&mut ev_compute[0], sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32);
+                        sys::cuEventCreate(&mut ev_compute[1], sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32);
+                    }
+
+                    // Pre-fetch chunk 0 into staging[0] on c_stream
+                    let n0 = chunk.min(s);
+                    let stg0 = if n0 == chunk { &staging[0] } else { tail_staging.as_ref().unwrap() };
+                    pbuf.fetch_chunk_staging_stream(0, n0, stg0, c_stream)?;
+                    unsafe {
+                        sys::cuEventRecord(ev_copy[0], c_stream);
+                    }
+
+                    let r_out_cached = match (&b.out, &raws) {
+                        (LinProj::Single(out), None) => Some(out.fetch(dev)?),
+                        _ => None,
+                    };
+
+                    let mut st = 0;
+                    let mut cur = 0;
+                    while st < s {
+                        let n = chunk.min(s - st);
+                        let nxt_st = st + n;
+                        let nxt = 1 - cur;
+
+                        // Prefetch next chunk on c_stream if remaining
+                        if nxt_st < s {
+                            let nxt_n = chunk.min(s - nxt_st);
+                            let stg_nxt = if nxt_n == chunk { &staging[nxt] } else { tail_staging.as_ref().unwrap() };
+                            unsafe {
+                                if st > 0 {
+                                    sys::cuStreamWaitEvent(c_stream, ev_compute[nxt], 0);
+                                }
+                            }
+                            pbuf.fetch_chunk_staging_stream(nxt_st, nxt_n, stg_nxt, c_stream)?;
+                            unsafe {
+                                sys::cuEventRecord(ev_copy[nxt], c_stream);
+                            }
+                        }
+
+                        // compute_stream waits for cur fetch to complete
+                        unsafe {
+                            sys::cuStreamWaitEvent(stream_compute, ev_copy[cur], 0);
+                        }
+
+                        let (stg_cur, gth_cur) = if n == chunk {
+                            (&staging[cur], &gathered[cur])
+                        } else {
+                            (tail_staging.as_ref().unwrap(), tail_gathered.as_ref().unwrap())
+                        };
+
+                        // Gather and compute on compute_stream
+                        kernels::gather_groups_to_rows_inplace(gth_cur, stg_cur, pbuf.groups, pbuf.w)?;
+
+                        let chunk_x = x.narrow(0, st, n)?;
+                        let chunk_idx = cx.idx.narrow(0, st, n)?;
+
+                        match (&b.out, &raws) {
+                            (LinProj::Single(out), Some([_, r_out, ..])) => {
+                                let yc = out.forward_raw(gth_cur, r_out, chunk)?;
+                                kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                            }
+                            (LinProj::Single(out), None) => {
+                                let r_out = r_out_cached.as_ref().unwrap();
+                                let yc = out.forward_raw(gth_cur, r_out, chunk)?;
+                                kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                            }
+                            (LinProj::Factorized(lr), _) => {
+                                let mid = lr.down.forward(gth_cur)?;
+                                let yc = lr.up.forward(&mid)?;
+                                kernels::gate_add_inplace(&chunk_x, &yc, &gate_msa, &chunk_idx)?;
+                            }
+                            _ => anyhow::bail!("unsupported out projection for pinned att"),
+                        }
+
+                        unsafe {
+                            sys::cuEventRecord(ev_compute[cur], stream_compute);
+                        }
+
+                        st = nxt_st;
+                        cur = nxt;
+                    }
+
+                    unsafe {
+                        sys::cuStreamSynchronize(stream_compute);
+                        sys::cuEventDestroy_v2(ev_copy[0]);
+                        sys::cuEventDestroy_v2(ev_copy[1]);
+                        sys::cuEventDestroy_v2(ev_compute[0]);
+                        sys::cuEventDestroy_v2(ev_compute[1]);
+                    }
+                    return Ok(());
+                }
+
+                // Fallback serial path
                 let staging = Tensor::zeros((pbuf.groups, chunk, pbuf.w), self.dtype, dev)?;
                 let gathered = Tensor::zeros((chunk, pbuf.groups * pbuf.w), self.dtype, dev)?;
                 match (&b.out, &raws) {

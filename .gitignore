@@ -6,3 +6,5 @@ out/
 *.bak*
 *.bak/
 .bak/
+__pycache__/
+*.pyc

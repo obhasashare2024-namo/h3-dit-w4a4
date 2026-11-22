@@ -40,11 +40,27 @@ impl PinnedAttBuffer {
         })
     }
 
+    pub fn host_ptr(&self, g: usize) -> *mut u8 {
+        let bytes_per_group = self.s * self.w * 2;
+        unsafe { self.ptr.add(g * bytes_per_group) }
+    }
+
+    pub fn host_ptr_offset(&self, g: usize, st: usize) -> *const u8 {
+        let offset = (g * self.s + st) * self.w * 2;
+        unsafe { self.ptr.add(offset) as *const u8 }
+    }
+
     /// Asynchronously DMA transfer a single attention group output [S, W] from GPU to Host
     pub fn write_group_async(&self, g: usize, o: &Tensor) -> Result<()> {
-        let bytes_per_group = self.s * self.w * 2;
-        let dst_host = unsafe { self.ptr.add(g * bytes_per_group) };
+        let dst_host = self.host_ptr(g);
         crate::kernels::copy_tensor_to_host_pinned_async(o, dst_host)?;
+        Ok(())
+    }
+
+    /// Asynchronously DMA transfer a single attention group output [S, W] from GPU to Host on a dedicated CUDA stream
+    pub fn write_group_async_stream(&self, g: usize, o: &Tensor, stream: sys::CUstream) -> Result<()> {
+        let dst_host = self.host_ptr(g);
+        crate::kernels::copy_tensor_to_host_pinned_async_stream(o, dst_host, stream)?;
         Ok(())
     }
 
@@ -53,11 +69,22 @@ impl PinnedAttBuffer {
     pub fn fetch_chunk_gathered(&self, st: usize, n: usize, staging: &Tensor, dst_gathered: &Tensor) -> Result<()> {
         let bytes_per_panel = n * self.w * 2;
         for g in 0..self.groups {
-            let host_src = unsafe { self.ptr.add((g * self.s + st) * self.w * 2) };
+            let host_src = self.host_ptr_offset(g, st);
             let dst_byte_offset = g * bytes_per_panel;
             crate::kernels::copy_host_pinned_to_tensor_offset_async(host_src, staging, dst_byte_offset, bytes_per_panel)?;
         }
         crate::kernels::gather_groups_to_rows_inplace(dst_gathered, staging, self.groups, self.w)?;
+        Ok(())
+    }
+
+    /// Asynchronously fetch row chunk [st..st+n] from Host to GPU staging on a dedicated CUDA stream
+    pub fn fetch_chunk_staging_stream(&self, st: usize, n: usize, staging: &Tensor, stream: sys::CUstream) -> Result<()> {
+        let bytes_per_panel = n * self.w * 2;
+        for g in 0..self.groups {
+            let host_src = self.host_ptr_offset(g, st);
+            let dst_byte_offset = g * bytes_per_panel;
+            crate::kernels::copy_host_pinned_to_tensor_offset_async_stream(host_src, staging, dst_byte_offset, bytes_per_panel, stream)?;
+        }
         Ok(())
     }
 }
