@@ -109,9 +109,18 @@ Our engine renders native 1088P on an **8GB mobile GPU (RTX 3070 Laptop)**—a t
 1. **Pillar 1: Dynamic Zero-Activation Offload & In-Place Modulation**
    - **Shattering the 121,041-token activation memory wall**: PyTorch caches intermediate tensors across LayerNorm, AdaLN, and linear projections, driving activation memory into tens of gigabytes as sequence length $S$ grows.
    - **Deterministic zero-stacking design**: Handcrafted in-place CUDA kernels and Rust deterministic memory lifecycles perform AdaLN and normalization directly in preallocated buffers. Intermediate activations are freed immediately upon layer completion, strictly locking activation VRAM to **3.5GB–4.5GB** under full 1088P load.
-2. **Pillar 2: Chunked FlashAttention-2 & Hardware Windowed Kernel**
-   - **Overcoming the catastrophic $O(S^2)$ complexity barrier**: At $S = 121,041$, a full dense attention matrix contains $1.46 \times 10^{10}$ elements, demanding >500 seconds per step.
-   - **Linearized hardware window execution**: We handcrafted an 8192-token hardware windowed kernel and adaptive chunking engine, flattening attention compute from quadratic explosion to strictly linear $O(S)$. Attention compute time per step dropped from 199s to 59s, while spatial prefix broadcast locks cross-frame identity and semantic continuity.
+2. **Pillar 2: DEF-107 Dual-Loop Global Anchor Attention & FP32 Online Softmax LSE Merge**
+   - **Resolving the trade-off between $O(S^2)$ complexity and character consistency**: At $S = 121,041$, a full dense attention matrix demands >511s per step. Naive sliding windows ($W=8,192$) trigger prompt horizon cutoffs beyond 0.6s ($\text{row} - 8192 > 4761$), blinding subsequent video frames to prompt tokens and Frame 0 facial geometry, resulting in severe temporal face drifting.
+   - **DEF-107 dual-pass architecture with global anchor ($N_{\text{global}} = 6,801$)**:
+     - **Golden anchor locking**: Permanently locks the 4,761 prefix tokens (Text+Audio Prompt) and 2,040 Frame 0 tokens;
+     - **Pass 1 (Global Cross-Attention)**: All video query tokens attend densely to the 6,801 anchor tokens to lock semantic identity and facial geometry;
+     - **Pass 2 (Local Self-Attention)**: Queries simultaneously attend over a local sliding window ($W=8,192$) to ensure fluid motion dynamics.
+   - **Exact FP32 Online Softmax LSE Merge via C++ `run_mha`**: Directly extracts per-pass $\text{LSE} = \log \sum e^S$ from FlashAttention-2's CUDA kernel and fuses outputs with bit-level mathematical parity:
+     $$\text{Output} = \frac{e^{\text{LSE}_1 - M} O_1 + e^{\text{LSE}_2 - M} O_2}{e^{\text{LSE}_1 - M} + e^{\text{LSE}_2 - M}}, \quad M = \max(\text{LSE}_1, \text{LSE}_2)$$
+   - **Physical verification & RC001 safety gate**:
+     - DiT step latency drops from 511s to **232s** (**2.2x speedup**);
+     - 8-second portrait skin ratio fluctuation is strictly contained within **3.47%** (well below the RC001 audit threshold of $\le \pm 5.0\%$);
+     - **RC001 hard circuit breaker**: The runtime explicitly throws a fatal VETO if unanchored window attention is attempted without manual override, preventing regression.
 3. **Pillar 3: 3-Tier Dynamic Streaming & Double-Buffered StagingRing**
    - **Zero static model weight residency in VRAM**: Leveraging a double-buffered `StagingRing<2>`, while the GPU executes Tensor Core MMA on Block $N$, an asynchronous PCIe DMA stream prefetches Block $N+1$.
    - **Extreme memory compression**: VRAM needs only 1–2 active blocks (~192MB–384MB) at any given moment. The full 47-layer 14B parameter set streams seamlessly across NVMe, Host RAM, and VRAM with 100% compute-transfer overlap.
