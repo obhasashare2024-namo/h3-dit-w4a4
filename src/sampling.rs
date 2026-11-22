@@ -71,11 +71,22 @@ pub fn sample_denoised(
                     std::env::remove_var("H3_DEF107_ANCHOR");
                     println!("[sampling] Step {}/{}: Full Dense FA-2 (Global Semantic Lock-in)", i + 1, n);
                 } else {
-                    let anchor_len = std::env::var("H3_GLOBAL_ANCHOR_LEN").unwrap_or_else(|_| "6801".to_string());
+                    let dyn_anchor = run.anchor_len();
+                    let anchor_len = if let Ok(force) = std::env::var("H3_FORCE_ANCHOR_LEN") {
+                        force.parse::<usize>().unwrap_or(dyn_anchor)
+                    } else if let Ok(val) = std::env::var("H3_GLOBAL_ANCHOR_LEN") {
+                        if val == "auto" {
+                            dyn_anchor
+                        } else {
+                            val.parse::<usize>().unwrap_or(dyn_anchor)
+                        }
+                    } else {
+                        dyn_anchor
+                    };
                     let win_size = std::env::var("H3_WINDOW_SIZE").unwrap_or_else(|_| "8192".to_string());
                     let def107_cfg = format!("{},{}", anchor_len, win_size);
                     std::env::set_var("H3_DEF107_ANCHOR", &def107_cfg);
-                    println!("[sampling] Step {}/{}: DEF-107 Dual-Loop Fusion FA-2 (Anchor={}, Window={})", i + 1, n, anchor_len, win_size);
+                    println!("[sampling] Step {}/{}: DEF-107/109 Dynamic Fusion FA-2 (Anchor={}, Window={}, dyn_calc={})", i + 1, n, anchor_len, win_size, dyn_anchor);
                 }
             }
         }

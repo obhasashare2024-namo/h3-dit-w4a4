@@ -581,6 +581,14 @@ impl DitRun {
     pub fn seq_len(&self) -> usize {
         self.layout.seq_len
     }
+
+    /// Compute dynamic global anchor length (all tokens before generative audio/video)
+    pub fn anchor_len(&self) -> usize {
+        self.layout.segments.iter()
+            .find(|(_, _, seg)| matches!(seg, Seg::Audio | Seg::Video))
+            .map(|(start, _, _)| *start)
+            .unwrap_or(6801)
+    }
 }
 
 pub(crate) struct RunControl {
