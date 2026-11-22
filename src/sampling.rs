@@ -65,19 +65,18 @@ pub fn sample_denoised(
     let n = sigmas.len() - 1;
     let mut last: Option<(Tensor, Tensor)> = None;
     for i in 0..n {
-        if let Ok(hybrid) = std::env::var("H3_HYBRID_WINDOW") {
-            if i == 0 {
-                if let Ok(pref) = std::env::var("H3_STEP0_PREFIX") {
-                    let pref_mode = format!("prefix:{},{}", pref, hybrid);
-                    std::env::set_var("H3_ATTN_WINDOW", &pref_mode);
-                    println!("[sampling] Step {}/{}: Prefix-Window FA-2 (H3_ATTN_WINDOW={})", i + 1, n, pref_mode);
+        if let Ok(sched) = std::env::var("H3_ATTN_SCHEDULE") {
+            if sched == "def107" || sched == "hybrid_def107" || sched == "def107_fusion" {
+                if i == 0 {
+                    std::env::remove_var("H3_DEF107_ANCHOR");
+                    println!("[sampling] Step {}/{}: Full Dense FA-2 (Global Semantic Lock-in)", i + 1, n);
                 } else {
-                    std::env::remove_var("H3_ATTN_WINDOW");
-                    println!("[sampling] Step {}/{}: Dense FA-2 (Global Semantic Lock-in)", i + 1, n);
+                    let anchor_len = std::env::var("H3_GLOBAL_ANCHOR_LEN").unwrap_or_else(|_| "6801".to_string());
+                    let win_size = std::env::var("H3_WINDOW_SIZE").unwrap_or_else(|_| "8192".to_string());
+                    let def107_cfg = format!("{},{}", anchor_len, win_size);
+                    std::env::set_var("H3_DEF107_ANCHOR", &def107_cfg);
+                    println!("[sampling] Step {}/{}: DEF-107 Dual-Loop Fusion FA-2 (Anchor={}, Window={})", i + 1, n, anchor_len, win_size);
                 }
-            } else {
-                std::env::set_var("H3_ATTN_WINDOW", &hybrid);
-                println!("[sampling] Step {}/{}: Windowed FA-2 (H3_ATTN_WINDOW={})", i + 1, n, hybrid);
             }
         }
         let (s, s_next) = (sigmas[i], sigmas[i + 1]);
