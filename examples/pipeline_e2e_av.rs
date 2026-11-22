@@ -45,6 +45,14 @@ struct Args {
     /// Path to Audio VAE weights
     #[arg(long, default_value = "/mnt/R2D/models/minimax_h3_audio_vae_fp32.safetensors")]
     audio_vae: String,
+
+    /// Output resolution scaling / interpolation: "none" (native), "1080p" (1920x1088), "2k" (2560x1440), "4k" (3840x2160)
+    #[arg(long, default_value = "none")]
+    scale: String,
+
+    /// Apply contrast-adaptive detail unsharp filter during interpolation
+    #[arg(long, default_value_t = true)]
+    unsharp: bool,
 }
 
 fn parse_device(name: &str) -> Result<Device> {
@@ -228,7 +236,12 @@ fn main() -> Result<()> {
     println!("\n[Muxing] Generating MP4: {}...", out_mp4);
     let t_mux = Instant::now();
     let audio_arg = audio_tuple.as_ref().map(|(w, sr)| (w, *sr));
-    h3_rs::media::write_mp4_from_cpuvid(&out_mp4, &vid, 24.0, audio_arg, 23)?;
+    let scale_opt = if args.scale == "none" || args.scale == "native" {
+        None
+    } else {
+        Some(args.scale.as_str())
+    };
+    h3_rs::media::write_mp4_from_cpuvid_scaled(&out_mp4, &vid, 24.0, audio_arg, 23, scale_opt, args.unsharp)?;
     println!("    MP4 written in {:.2}s!", t_mux.elapsed().as_secs_f64());
 
     if let Some((wave, sr)) = audio_tuple {

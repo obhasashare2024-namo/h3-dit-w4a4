@@ -356,6 +356,18 @@ pub fn resize_trilinear(src: &[f32], from: (usize, usize, usize), to: (usize, us
 /// Zero-copy streaming muxing from CpuVid buffer directly into ffmpeg.
 /// Completely bypasses 14+ GB redundant Tensor allocations for long sequences.
 pub fn write_mp4_from_cpuvid(path: &str, vid: &crate::vae_video::CpuVid, fps: f64, audio: Option<(&Tensor, u32)>, crf: u32) -> Result<()> {
+    write_mp4_from_cpuvid_scaled(path, vid, fps, audio, crf, None, false)
+}
+
+pub fn write_mp4_from_cpuvid_scaled(
+    path: &str,
+    vid: &crate::vae_video::CpuVid,
+    fps: f64,
+    audio: Option<(&Tensor, u32)>,
+    crf: u32,
+    scale: Option<&str>,
+    unsharp: bool,
+) -> Result<()> {
     let (t, h, w) = (vid.f, vid.h, vid.w);
     let fs = h * w;
     let wav = audio.map(|_| format!("{path}.tmp.wav"));
@@ -366,6 +378,31 @@ pub fn write_mp4_from_cpuvid(path: &str, vid: &crate::vae_video::CpuVid, fps: f6
     cmd.args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
     if let Some(wp) = &wav {
         cmd.args(["-i", wp, "-c:a", "aac", "-b:a", "192k"]);
+    }
+    if let Some(s) = scale {
+        let s_lower = s.to_lowercase();
+        let filter: &str = match s_lower.as_str() {
+            "1080p" | "1088p" => {
+                if unsharp {
+                    "scale=1920:1088:flags=lanczos+accurate_rnd,unsharp=5:5:0.8:3:3:0.4"
+                } else {
+                    "scale=1920:1088:flags=lanczos+accurate_rnd"
+                }
+            }
+            "2k" | "1440p" => {
+                if unsharp {
+                    "scale=2560:1440:flags=lanczos+accurate_rnd,unsharp=5:5:1.0:3:3:0.5"
+                } else {
+                    "scale=2560:1440:flags=lanczos+accurate_rnd"
+                }
+            }
+            "4k" | "2160p" => "scale=3840:2160:flags=lanczos+accurate_rnd",
+            "none" | "native" => "",
+            custom => custom,
+        };
+        if !filter.is_empty() {
+            cmd.args(["-vf", filter]);
+        }
     }
     cmd.args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", &crf.to_string(), "-preset", "medium", "-movflags", "+faststart", path]);
     let mut child = cmd.stdin(Stdio::piped()).spawn().context("running ffmpeg")?;
